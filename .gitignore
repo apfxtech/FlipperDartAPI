@@ -1,0 +1,6 @@
+.dart_tool/
+.packages
+build/
+pubspec.lock
+tools/protoc/
+tools/protoc.zip
