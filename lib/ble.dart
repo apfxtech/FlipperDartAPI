@@ -3,8 +3,7 @@ part of 'flipper_client.dart';
 class _BleTransport extends _Transport {
   static const String overflowCharUuid =
       '19ed82ae-ed21-4c9d-4145-228e63fe0000';
-  static const Duration _bufferWaitTimeout = Duration(seconds: 5);
-  static const Duration _writeWithoutResponsePace = Duration(milliseconds: 4);
+  static const Duration _serialSendWaitTimeout = Duration(milliseconds: 100);
 
   final BleDiscoveredDevice _device;
 
@@ -19,8 +18,17 @@ class _BleTransport extends _Transport {
   String? _overflowSvcId;
   String? _overflowCharId;
   bool _hasOverflowControl = false;
-  int _remainingBuffer = 0;
-  Completer<void>? _bufferSignal;
+
+  final List<_BlePendingSend> _txQueue = [];
+  Completer<void>? _txDataSignal;
+
+  Uint8List? _pendingBytes;
+
+  int _budget = 0;
+  int _budgetGen = 0;
+  Completer<void>? _budgetSignal;
+
+  bool _senderRunning = false;
 
   _BleTransport._(this._device);
 
@@ -35,8 +43,11 @@ class _BleTransport extends _Transport {
     int negotiatedMtu = 23;
     try {
       negotiatedMtu =
-          await uble.UniversalBle.requestMtu(_device.device.deviceId, 512);
-    } catch (_) {}
+          await uble.UniversalBle.requestMtu(_device.device.deviceId, 517);
+    } catch (e) {
+      LogService.log(
+          '[BLE] requestMtu failed: $e (using default $negotiatedMtu)');
+    }
 
     final services =
         await uble.UniversalBle.discoverServices(_device.device.deviceId);
@@ -58,10 +69,7 @@ class _BleTransport extends _Transport {
             txSvc = service.uuid;
             txChar = char.uuid;
             txWithResponse =
-                char.properties.contains(uble.CharacteristicProperty.write) &&
-                    !char.properties.contains(
-                      uble.CharacteristicProperty.writeWithoutResponse,
-                    );
+                char.properties.contains(uble.CharacteristicProperty.write);
           }
           if (cid == FlipperClient.bleRxUuid) {
             rxSvc = service.uuid;
@@ -88,10 +96,7 @@ class _BleTransport extends _Transport {
             txSvc = service.uuid;
             txChar = char.uuid;
             txWithResponse =
-                char.properties.contains(uble.CharacteristicProperty.write) &&
-                    !char.properties.contains(
-                      uble.CharacteristicProperty.writeWithoutResponse,
-                    );
+                char.properties.contains(uble.CharacteristicProperty.write);
           }
           if (rxSvc == null &&
               char.properties.contains(uble.CharacteristicProperty.indicate)) {
@@ -179,6 +184,10 @@ class _BleTransport extends _Transport {
         _hasOverflowControl = false;
       }
     }
+
+    if (_hasOverflowControl) {
+      _startSender();
+    }
   }
 
   void _onValueChange(
@@ -204,73 +213,246 @@ class _BleTransport extends _Transport {
     if (value.length < 4) return;
     final view = ByteData.view(Uint8List.fromList(value).buffer);
     final remaining = view.getInt32(0, Endian.big);
-    LogService.log('[BLE] overflow remaining=$remaining');
-    _remainingBuffer = remaining;
-    final signal = _bufferSignal;
+    _budget = remaining;
+    _budgetGen += 1;
+    LogService.log('[BLE] overflow remaining=$remaining (gen $_budgetGen)');
+    final signal = _budgetSignal;
+    _budgetSignal = null;
     if (signal != null && !signal.isCompleted) signal.complete();
   }
 
   @override
   Future<void> rawWrite(Uint8List bytes) async {
+    if (_closed) throw StateError('BLE transport closed');
+    if (bytes.isEmpty) return;
+
+    if (!_hasOverflowControl) {
+      await _writeRawDirect(bytes);
+      return;
+    }
+
+    final completer = Completer<void>();
+    _txQueue.add(_BlePendingSend(bytes, completer));
+    final sig = _txDataSignal;
+    _txDataSignal = null;
+    if (sig != null && !sig.isCompleted) sig.complete();
+    _startSender();
+    await completer.future;
+  }
+
+  Future<void> _writeRawDirect(Uint8List bytes) async {
     var offset = 0;
     while (offset < bytes.length) {
-      if (_closed) {
-        throw StateError('BLE transport closed');
-      }
-
-      int chunkLimit = _bleChunkSize;
-      if (_hasOverflowControl) {
-        while (_remainingBuffer <= 0 && !_closed) {
-          await _waitForBufferUpdate();
-        }
-        if (_closed) {
-          throw StateError('BLE transport closed');
-        }
-        chunkLimit = _remainingBuffer < _bleChunkSize
-            ? _remainingBuffer
-            : _bleChunkSize;
-      }
-
-      final end = (offset + chunkLimit) > bytes.length
+      if (_closed) throw StateError('BLE transport closed');
+      final end = (offset + _bleChunkSize) > bytes.length
           ? bytes.length
-          : offset + chunkLimit;
-      final chunk = bytes.sublist(offset, end);
-
+          : offset + _bleChunkSize;
       await uble.UniversalBle.write(
         _device.device.deviceId,
         _txSvcId,
         _txCharId,
-        chunk,
+        bytes.sublist(offset, end),
         withoutResponse: !_txWithResponse,
       );
-
-      if (_hasOverflowControl) {
-        _remainingBuffer -= chunk.length;
-      }
       offset = end;
+    }
+  }
 
-      if (!_txWithResponse && !_hasOverflowControl) {
-        await Future<void>.delayed(_writeWithoutResponsePace);
+  void _startSender() {
+    if (_senderRunning) return;
+    _senderRunning = true;
+    unawaited(_runSender());
+  }
+
+  Future<void> _runSender() async {
+    try {
+      while (!_closed) {
+        if (_budget <= 0) {
+          await _waitForBudget();
+          continue;
+        }
+        final gen = _budgetGen;
+        await _sendCommandsWhileBufferNotEnd(_budget, gen);
+      }
+    } catch (e, st) {
+      LogService.log('[BLE] sender error: $e\n$st');
+      _failAllPending(e);
+    } finally {
+      _senderRunning = false;
+    }
+  }
+
+  Future<void> _sendCommandsWhileBufferNotEnd(int initialBudget, int gen) async {
+    var remaining = initialBudget;
+
+    while (remaining > 0 && !_closed && _budgetGen == gen) {
+      final pending = _takePendingBytes(remaining);
+      remaining -= pending.length;
+
+      if (remaining == 0) {
+        await _bleWrite(pending);
+        _budget -= pending.length;
+        return;
+      }
+
+      final batch = await _readPendingCommands(
+        remaining,
+        waitInfinite: pending.isEmpty,
+        gen: gen,
+      );
+      if (batch == null) {
+        if (pending.isNotEmpty) {
+          await _bleWrite(pending);
+          _budget -= pending.length;
+        }
+        return;
+      }
+
+      assert(remaining >= batch.bytes.length);
+      remaining -= batch.bytes.length;
+
+      final combined = pending.isEmpty
+          ? batch.bytes
+          : (Uint8List(pending.length + batch.bytes.length)
+            ..setRange(0, pending.length, pending)
+            ..setRange(pending.length, pending.length + batch.bytes.length,
+                batch.bytes));
+
+      try {
+        await _bleWrite(combined);
+        _budget -= combined.length;
+      } catch (e) {
+        for (final entry in batch.entries) {
+          if (!entry.completer.isCompleted) entry.completer.completeError(e);
+        }
+        rethrow;
+      }
+      for (final entry in batch.entries) {
+        if (!entry.completer.isCompleted) entry.completer.complete();
       }
     }
   }
 
-  Future<void> _waitForBufferUpdate() {
+  Uint8List _takePendingBytes(int maxLen) {
+    final pending = _pendingBytes;
+    if (pending == null) return Uint8List(0);
+    if (pending.length <= maxLen) {
+      _pendingBytes = null;
+      return pending;
+    }
+    final take = pending.sublist(0, maxLen);
+    _pendingBytes = pending.sublist(maxLen);
+    return take;
+  }
+
+  Future<_BleBatch?> _readPendingCommands(
+    int maxBytes, {
+    required bool waitInfinite,
+    required int gen,
+  }) async {
+    final out = BytesBuilder(copy: false);
+    final entries = <_BlePendingSend>[];
+    var remaining = maxBytes;
+    var firstRead = true;
+
+    while (remaining > 0 && !_closed && _budgetGen == gen) {
+      _BlePendingSend entry;
+      if (_txQueue.isNotEmpty) {
+        entry = _txQueue.first;
+      } else if (firstRead && waitInfinite) {
+        await _waitForData();
+        if (_closed || _budgetGen != gen || _txQueue.isEmpty) break;
+        entry = _txQueue.first;
+      } else {
+        final got = await _waitForDataWithTimeout(_serialSendWaitTimeout);
+        if (!got || _closed || _budgetGen != gen || _txQueue.isEmpty) break;
+        entry = _txQueue.first;
+      }
+      firstRead = false;
+
+      final entryBytes = entry.bytes;
+      if (remaining >= entryBytes.length) {
+        out.add(entryBytes);
+        remaining -= entryBytes.length;
+        _txQueue.removeAt(0);
+        entries.add(entry);
+      } else {
+        out.add(entryBytes.sublist(0, remaining));
+        _pendingBytes = entryBytes.sublist(remaining);
+        _txQueue.removeAt(0);
+        entries.add(entry);
+        remaining = 0;
+      }
+    }
+
+    final result = out.takeBytes();
+    if (result.isEmpty) return null;
+    return _BleBatch(result, entries);
+  }
+
+  Future<void> _bleWrite(Uint8List data) async {
+    var offset = 0;
+    while (offset < data.length) {
+      if (_closed) throw StateError('BLE transport closed');
+      final end = (offset + _bleChunkSize) > data.length
+          ? data.length
+          : offset + _bleChunkSize;
+      await uble.UniversalBle.write(
+        _device.device.deviceId,
+        _txSvcId,
+        _txCharId,
+        data.sublist(offset, end),
+        withoutResponse: !_txWithResponse,
+      );
+      offset = end;
+    }
+  }
+
+  Future<void> _waitForBudget() async {
     final completer = Completer<void>();
-    _bufferSignal = completer;
-    return completer.future.timeout(
-      _bufferWaitTimeout,
-      onTimeout: () {
-        LogService.log('[BLE] overflow buffer wait timeout');
-      },
-    );
+    _budgetSignal = completer;
+    await completer.future;
+  }
+
+  Future<void> _waitForData() async {
+    final completer = Completer<void>();
+    _txDataSignal = completer;
+    await completer.future;
+  }
+
+  Future<bool> _waitForDataWithTimeout(Duration timeout) async {
+    if (_txQueue.isNotEmpty) return true;
+    final completer = Completer<void>();
+    _txDataSignal = completer;
+    try {
+      await completer.future.timeout(timeout);
+      return true;
+    } on TimeoutException {
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  void _failAllPending(Object error) {
+    final pendings = List<_BlePendingSend>.from(_txQueue);
+    _txQueue.clear();
+    for (final p in pendings) {
+      if (!p.completer.isCompleted) p.completer.completeError(error);
+    }
   }
 
   @override
   void onFaultExtra(Object error) {
-    final signal = _bufferSignal;
-    _bufferSignal = null;
-    if (signal != null && !signal.isCompleted) signal.complete();
+    final budgetSignal = _budgetSignal;
+    _budgetSignal = null;
+    if (budgetSignal != null && !budgetSignal.isCompleted) {
+      budgetSignal.complete();
+    }
+    final dataSignal = _txDataSignal;
+    _txDataSignal = null;
+    if (dataSignal != null && !dataSignal.isCompleted) dataSignal.complete();
+    _failAllPending(error);
   }
 
   @override
@@ -282,15 +464,33 @@ class _BleTransport extends _Transport {
 
   @override
   Future<void> doClose() async {
-    final signal = _bufferSignal;
-    _bufferSignal = null;
-    if (signal != null && !signal.isCompleted) signal.complete();
+    final budgetSignal = _budgetSignal;
+    _budgetSignal = null;
+    if (budgetSignal != null && !budgetSignal.isCompleted) {
+      budgetSignal.complete();
+    }
+    final dataSignal = _txDataSignal;
+    _txDataSignal = null;
+    if (dataSignal != null && !dataSignal.isCompleted) dataSignal.complete();
+    _failAllPending(StateError('BLE transport closed'));
     uble.UniversalBle.onConnectionChange = null;
     uble.UniversalBle.onValueChange = null;
     try {
       await uble.UniversalBle.disconnect(_device.device.deviceId);
     } catch (_) {}
   }
+}
+
+class _BlePendingSend {
+  _BlePendingSend(this.bytes, this.completer);
+  final Uint8List bytes;
+  final Completer<void> completer;
+}
+
+class _BleBatch {
+  _BleBatch(this.bytes, this.entries);
+  final Uint8List bytes;
+  final List<_BlePendingSend> entries;
 }
 
 extension FlipperBleApi on FlipperClient {

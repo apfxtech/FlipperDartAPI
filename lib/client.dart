@@ -703,7 +703,7 @@ class FlipperClient {
 
   Future<List<Main>> callRpcFramesMulti(
     Future<void> Function(Future<void> Function(Main frame) sendFrame) body, {
-    Duration timeout = const Duration(minutes: 15),
+    Duration timeout = const Duration(seconds: 60),
     FlipperRequestPriority priority = FlipperRequestPriority.defaultPriority,
   }) async {
     if (_mode != FlipperMode.rpc) {
@@ -736,6 +736,7 @@ class FlipperClient {
           seq: _requestSeq++,
           onSent: () {
             if (wasFinal) finalFrameSent = true;
+            pending.rearmTimeout();
             if (!completer.isCompleted) completer.complete();
           },
           onError: (error) {
@@ -1298,16 +1299,36 @@ class _PendingRpc {
     frames.add(frame);
   }
 
+  Duration? _watchdogTimeout;
+  void Function()? _watchdogCallback;
+
   void armTimeout(Duration timeout, void Function() onTimeout) {
+    _watchdogTimeout = timeout;
+    _watchdogCallback = onTimeout;
+    _scheduleTimer();
+  }
+
+  void rearmTimeout() {
+    if (_watchdogTimeout == null || _watchdogCallback == null) return;
+    _scheduleTimer();
+  }
+
+  void _scheduleTimer() {
+    _timeoutTimer?.cancel();
+    final timeout = _watchdogTimeout;
+    final cb = _watchdogCallback;
+    if (timeout == null || cb == null) return;
     _timeoutTimer = Timer(timeout, () {
       if (_completer.isCompleted) return;
-      onTimeout();
+      cb();
     });
   }
 
   void cancelTimeout() {
     _timeoutTimer?.cancel();
     _timeoutTimer = null;
+    _watchdogTimeout = null;
+    _watchdogCallback = null;
   }
 
   void complete() {
@@ -1351,6 +1372,8 @@ abstract class _Transport {
   bool get supportsCli;
 
   FlipperMode get initialMode;
+
+  int get storageChunkSize => 512;
 
   Future<void> open();
 

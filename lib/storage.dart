@@ -154,19 +154,20 @@ extension FlipperStorageApi on FlipperClient {
     );
   }
 
-  static const int _kChunkSize = 512;
-
   Future<void> storageWriteChunked(
     String path,
     List<int> data, {
     void Function(double progress)? onProgress,
-    Duration timeout = const Duration(minutes: 10),
+    Duration timeout = const Duration(seconds: 60),
     FlipperRequestPriority priority = FlipperRequestPriority.background,
   }) async {
     final total = data.length;
+    final chunkSize = _transport?.storageChunkSize ?? 512;
     final totalFrames =
-        total == 0 ? 1 : ((total + _kChunkSize - 1) ~/ _kChunkSize);
-    LogService.log('[Storage] write "$path": ${total}B, $totalFrames frames');
+        total == 0 ? 1 : ((total + chunkSize - 1) ~/ chunkSize);
+    LogService.log(
+      '[Storage] write "$path": ${total}B, $totalFrames frames, chunk=$chunkSize',
+    );
 
     await callRpcFramesMulti(
       (sendFrame) async {
@@ -174,7 +175,7 @@ extension FlipperStorageApi on FlipperClient {
         var frameIndex = 0;
         while (true) {
           final end =
-              (offset + _kChunkSize) > total ? total : (offset + _kChunkSize);
+              (offset + chunkSize) > total ? total : (offset + chunkSize);
           final chunk =
               offset == end ? const <int>[] : data.sublist(offset, end);
           final hasNext = end < total;
