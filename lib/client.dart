@@ -967,27 +967,41 @@ class FlipperClient {
           ),
         );
       }
-    } else {
-      for (final portName in SerialPort.availablePorts) {
+    } else if (_supportsDesktopSerial) {
+      final availablePorts = _readSerialProperty(
+        () => SerialPort.availablePorts,
+      );
+      for (final portName in availablePorts ?? const <String>[]) {
         final port = SerialPort(portName);
         try {
+          final description = _readSerialString(() => port.description) ?? '';
+          final vendorId = _readSerialInt(() => port.vendorId);
+          final productId = _readSerialInt(() => port.productId);
+          final serialNumber = _readSerialString(() => port.serialNumber);
+          if (!_shouldIncludeDesktopUsbPort(
+            portName,
+            description: description,
+            vendorId: vendorId,
+            productId: productId,
+          )) {
+            continue;
+          }
+
           result.add(
             FlipperDevice(
               id: portName,
-              name: (port.description?.isNotEmpty == true)
-                  ? port.description!
-                  : portName,
+              name: description.isNotEmpty ? description : portName,
               link: FlipperLink.usb,
               source: DesktopUsbDiscoveredDevice(
                 portName,
-                port.description ?? '',
-                vendorId: port.vendorId,
-                productId: port.productId,
-                serialNumber: port.serialNumber,
+                description,
+                vendorId: vendorId,
+                productId: productId,
+                serialNumber: serialNumber,
               ),
-              vendorId: port.vendorId,
-              productId: port.productId,
-              serialNumber: port.serialNumber,
+              vendorId: vendorId,
+              productId: productId,
+              serialNumber: serialNumber,
             ),
           );
         } finally {
@@ -1001,6 +1015,46 @@ class FlipperClient {
     }
     return result;
   }
+
+  bool get _supportsDesktopSerial =>
+      Platform.isLinux || Platform.isMacOS || Platform.isWindows;
+
+  bool _shouldIncludeDesktopUsbPort(
+    String portName, {
+    required String description,
+    required int? vendorId,
+    required int? productId,
+  }) {
+    const flipperVid = 0x0483;
+    const flipperPid = 0x5740;
+    if (vendorId == flipperVid && productId == flipperPid) return true;
+
+    final lowerDescription = description.toLowerCase();
+    if (lowerDescription.contains('flipper') ||
+        lowerDescription.contains('stm32') ||
+        lowerDescription.contains('virtual com')) {
+      return true;
+    }
+
+    if (!Platform.isLinux) return true;
+
+    return portName.startsWith('/dev/ttyACM') ||
+        portName.startsWith('/dev/ttyUSB');
+  }
+
+  T? _readSerialProperty<T>(T? Function() read) {
+    try {
+      return read();
+    } catch (e) {
+      LogService.log('[USB] failed to read serial port metadata: $e');
+      return null;
+    }
+  }
+
+  int? _readSerialInt(int? Function() read) => _readSerialProperty(read);
+
+  String? _readSerialString(String? Function() read) =>
+      _readSerialProperty(read);
 
   FlipperDevice _fromDiscovered(DiscoveredDevice device) {
     if (device is BleDiscoveredDevice) {

@@ -55,7 +55,11 @@ void desktopUsbIsolateEntry(DesktopUsbIsolateConfig config) {
   try {
     port = SerialPort(config.portName);
     if (!port.openReadWrite()) {
-      config.eventPort.send(DesktopUsbFault('Failed to open ${config.portName}'));
+      final error = SerialPort.lastError?.message;
+      final details = error == null ? '' : ': $error';
+      config.eventPort.send(
+        DesktopUsbFault('Failed to open ${config.portName}$details'),
+      );
       config.eventPort.send(const DesktopUsbExited());
       commandPort.close();
       return;
@@ -65,9 +69,12 @@ void desktopUsbIsolateEntry(DesktopUsbIsolateConfig config) {
       ..bits = 8
       ..stopBits = 1
       ..parity = SerialPortParity.none;
+    cfg.setFlowControl(SerialPortFlowControl.none);
     port.config = cfg;
   } catch (e) {
-    config.eventPort.send(DesktopUsbFault('Open error: $e'));
+    final error = SerialPort.lastError?.message;
+    final details = error == null ? '$e' : '$e ($error)';
+    config.eventPort.send(DesktopUsbFault('Open error: $details'));
     config.eventPort.send(const DesktopUsbExited());
     commandPort.close();
     return;

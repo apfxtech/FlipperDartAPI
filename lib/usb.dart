@@ -130,7 +130,11 @@ class _DesktopUsbTransport extends _Transport {
       debugName: 'flipper-usb-${device.portName}',
     );
 
-    final result = await boot.future;
+    final result = await boot.future.timeout(
+      const Duration(seconds: 5),
+      onTimeout: () =>
+          const DesktopUsbFault('Timed out opening USB serial port'),
+    );
     await bootSub.cancel();
 
     if (result is DesktopUsbFault) {
