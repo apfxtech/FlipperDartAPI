@@ -22,9 +22,9 @@ class FlipperRpcException implements Exception {
   final Main response;
 
   FlipperRpcException(this.response)
-      : status = response.commandStatus,
-        statusValue = response.commandStatus.value,
-        statusName = response.commandStatus.name;
+    : status = response.commandStatus,
+      statusValue = response.commandStatus.value,
+      statusName = response.commandStatus.name;
 
   @override
   String toString() => 'FlipperRpcException($statusName=$statusValue)';
@@ -313,7 +313,8 @@ class FlipperClient {
 
   Stream<FlipperRpcException> get errorStream => _errorCtrl.stream;
 
-  List<FlipperDevice> get devices => List.unmodifiable(_devices.values.toList());
+  List<FlipperDevice> get devices =>
+      List.unmodifiable(_devices.values.toList());
 
   List<FlipperDevice> listDevices() => devices;
 
@@ -334,9 +335,7 @@ class FlipperClient {
   }
 
   Future<void> initialize() async {
-    if (Platform.isAndroid || Platform.isIOS) {
-      await _requestBlePermissions();
-    }
+    await _blePlatform.requestPermissions();
   }
 
   Future<List<FlipperDevice>> refreshDevices({
@@ -355,9 +354,7 @@ class FlipperClient {
     return refreshDevices(bleTimeout: bleTimeout);
   }
 
-  Future<void> scanBle({
-    Duration timeout = const Duration(seconds: 10),
-  }) async {
+  Future<void> scanBle({Duration timeout = const Duration(seconds: 10)}) async {
     if (_scanning) return;
 
     final state = await uble.UniversalBle.getBluetoothAvailabilityState();
@@ -366,14 +363,56 @@ class FlipperClient {
       return;
     }
 
+    for (final device in await _blePlatform.loadKnownDevices()) {
+      _rememberDevice(_fromDiscovered(device));
+    }
+
     _scanning = true;
+    final phaseResults = <BleDiscoveredDevice>[];
     uble.UniversalBle.onScanResult = (device) {
-      _rememberDevice(_fromDiscovered(BleDiscoveredDevice(device)));
+      final discovered = BleDiscoveredDevice(device);
+      phaseResults.add(discovered);
+      LogService.log(
+        '[BLE] scan result id=${discovered.id} name=${discovered.name} '
+        'rssi=${discovered.rssi} services=${device.services}',
+      );
+      _rememberDevice(_fromDiscovered(discovered));
     };
 
-    await uble.UniversalBle.startScan();
-    await Future.delayed(timeout);
-    await stopScan();
+    final filters = _blePlatform.scanFilters.toList(growable: false);
+    final phaseTimeout = filters.length <= 1
+        ? timeout
+        : Duration(
+            milliseconds: (timeout.inMilliseconds ~/ filters.length).clamp(
+              1000,
+              timeout.inMilliseconds,
+            ),
+          );
+    try {
+      for (var i = 0; i < filters.length && _scanning; i++) {
+        final filter = filters[i];
+        LogService.log(
+          '[BLE] start scan phase ${i + 1}/${filters.length} '
+          'filterServices=${filter?.withServices ?? const <String>[]}',
+        );
+        phaseResults.clear();
+        await uble.UniversalBle.startScan(scanFilter: filter);
+        await Future.delayed(phaseTimeout);
+        await uble.UniversalBle.stopScan();
+        final resolved = await _blePlatform.resolveScanResults(phaseResults);
+        if (resolved.isNotEmpty) {
+          for (final device in resolved) {
+            _rememberDevice(_fromDiscovered(device));
+          }
+          _emitDevices();
+        }
+        if (_hasFilteredBleDevice()) break;
+      }
+    } finally {
+      uble.UniversalBle.onScanResult = null;
+      _scanning = false;
+      _emitDevices();
+    }
   }
 
   Future<void> stopScan() async {
@@ -384,10 +423,7 @@ class FlipperClient {
     _emitDevices();
   }
 
-  Future<FlipperDevice> connectById(
-    String id, {
-    FlipperLink? link,
-  }) async {
+  Future<FlipperDevice> connectById(String id, {FlipperLink? link}) async {
     FlipperDevice? device;
     for (final candidate in devices) {
       if (candidate.id != id) continue;
@@ -514,9 +550,13 @@ class FlipperClient {
         (text) => text.contains('start_rpc_session'),
         timeout: const Duration(seconds: 2),
       );
-      LogService.log('[RPC] start_rpc_session echoed, flushing serial buffer...');
+      LogService.log(
+        '[RPC] start_rpc_session echoed, flushing serial buffer...',
+      );
     } catch (e) {
-      LogService.log('[RPC] start_rpc_session echo timeout ($e), may already be in RPC mode');
+      LogService.log(
+        '[RPC] start_rpc_session echo timeout ($e), may already be in RPC mode',
+      );
     }
 
     await Future<void>.delayed(const Duration(milliseconds: 150));
@@ -659,7 +699,9 @@ class FlipperClient {
     if (_mode != FlipperMode.rpc) {
       await switchToRpcMode();
     }
-    final commandId = request.commandId == 0 ? nextCommandId() : request.commandId;
+    final commandId = request.commandId == 0
+        ? nextCommandId()
+        : request.commandId;
     request.commandId = commandId;
 
     final pending = _PendingRpc(commandId);
@@ -949,112 +991,29 @@ class FlipperClient {
   }
 
   Future<List<FlipperDevice>> _loadUsbDevices() async {
-    final result = <FlipperDevice>[];
-
-    if (Platform.isAndroid) {
-      final devices = await UsbSerial.listDevices();
-      for (final device in devices) {
-        result.add(
-          FlipperDevice(
-            id: '${device.vid}:${device.pid}',
-            name: (device.productName?.isNotEmpty == true)
-                ? device.productName!
-                : 'USB VID:0x${device.vid?.toRadixString(16) ?? '?'} PID:0x${device.pid?.toRadixString(16) ?? '?'}',
-            link: FlipperLink.usb,
-            source: AndroidUsbDiscoveredDevice(device),
-            vendorId: device.vid,
-            productId: device.pid,
-          ),
-        );
-      }
-    } else if (_supportsDesktopSerial) {
-      final availablePorts = _readSerialProperty(
-        () => SerialPort.availablePorts,
-      );
-      for (final portName in availablePorts ?? const <String>[]) {
-        final port = SerialPort(portName);
-        try {
-          final description = _readSerialString(() => port.description) ?? '';
-          final vendorId = _readSerialInt(() => port.vendorId);
-          final productId = _readSerialInt(() => port.productId);
-          final serialNumber = _readSerialString(() => port.serialNumber);
-          if (!_shouldIncludeDesktopUsbPort(
-            portName,
-            description: description,
-            vendorId: vendorId,
-            productId: productId,
-          )) {
-            continue;
-          }
-
-          result.add(
-            FlipperDevice(
-              id: portName,
-              name: description.isNotEmpty ? description : portName,
-              link: FlipperLink.usb,
-              source: DesktopUsbDiscoveredDevice(
-                portName,
-                description,
-                vendorId: vendorId,
-                productId: productId,
-                serialNumber: serialNumber,
-              ),
-              vendorId: vendorId,
-              productId: productId,
-              serialNumber: serialNumber,
-            ),
-          );
-        } finally {
-          port.dispose();
-        }
-      }
-    }
-
+    final result = await _usbPlatform.loadDevices();
     for (final device in result) {
       _rememberDevice(device);
     }
     return result;
   }
 
-  bool get _supportsDesktopSerial =>
-      Platform.isLinux || Platform.isMacOS || Platform.isWindows;
-
-  bool _shouldIncludeDesktopUsbPort(
-    String portName, {
-    required String description,
-    required int? vendorId,
-    required int? productId,
-  }) {
-    const flipperVid = 0x0483;
-    const flipperPid = 0x5740;
-    if (vendorId == flipperVid && productId == flipperPid) return true;
-
-    final lowerDescription = description.toLowerCase();
-    if (lowerDescription.contains('flipper') ||
-        lowerDescription.contains('stm32') ||
-        lowerDescription.contains('virtual com')) {
-      return true;
-    }
-
-    if (!Platform.isLinux) return true;
-
-    return portName.startsWith('/dev/ttyACM') ||
-        portName.startsWith('/dev/ttyUSB');
+  bool _hasFilteredBleDevice() {
+    return _devices.values.any(
+      (device) => device.isBle && isFlipperDevice(device),
+    );
   }
 
-  T? _readSerialProperty<T>(T? Function() read) {
-    try {
-      return read();
-    } catch (e) {
-      LogService.log('[USB] failed to read serial port metadata: $e');
-      return null;
+  bool isFlipperDevice(FlipperDevice device) {
+    final source = device.source;
+    if (source is BleDiscoveredDevice) {
+      return _blePlatform.includeDevice(source);
     }
+    if (source is UsbDiscoveredDevice) {
+      return _usbPlatform.includeDevice(device);
+    }
+    return false;
   }
-
-  int? _readSerialInt(int? Function() read) => _readSerialProperty(read);
-
-  String? _readSerialString(String? Function() read) =>
-      _readSerialProperty(read);
 
   FlipperDevice _fromDiscovered(DiscoveredDevice device) {
     if (device is BleDiscoveredDevice) {
@@ -1092,19 +1051,14 @@ class FlipperClient {
 
   Future<_Transport> _openTransport(FlipperDevice device) {
     if (device.source is BleDiscoveredDevice) {
-      return _BleTransport.create(device.source as BleDiscoveredDevice);
+      return _blePlatform.openTransport(device.source as BleDiscoveredDevice);
     }
-    if (device.source is AndroidUsbDiscoveredDevice) {
-      return _AndroidUsbTransport.create(
-        device.source as AndroidUsbDiscoveredDevice,
-      );
+    if (device.source is UsbDiscoveredDevice) {
+      return _usbPlatform.openTransport(device.source as UsbDiscoveredDevice);
     }
-    if (device.source is DesktopUsbDiscoveredDevice) {
-      return _DesktopUsbTransport.create(
-        device.source as DesktopUsbDiscoveredDevice,
-      );
-    }
-    throw UnsupportedError('Unsupported device source: ${device.source.runtimeType}');
+    throw UnsupportedError(
+      'Unsupported device source: ${device.source.runtimeType}',
+    );
   }
 
   void _onTransportBytes(List<int> chunk) {
@@ -1113,7 +1067,9 @@ class FlipperClient {
     if (_mode == FlipperMode.rpc) {
       final frames = _frameBuffer.push(chunk);
       if (frames.isEmpty) {
-        LogService.log('[RPC] rx ${chunk.length} bytes, buffering (pending frame)');
+        LogService.log(
+          '[RPC] rx ${chunk.length} bytes, buffering (pending frame)',
+        );
         return;
       }
       for (final frame in frames) {
@@ -1123,7 +1079,9 @@ class FlipperClient {
     }
 
     final text = _utf8Decoder.convert(chunk);
-    LogService.log('[CLI] rx: ${text.replaceAll('\r', '\\r').replaceAll('\n', '\\n')}');
+    LogService.log(
+      '[CLI] rx: ${text.replaceAll('\r', '\\r').replaceAll('\n', '\\n')}',
+    );
     _textCtrl.add(text);
   }
 
@@ -1132,9 +1090,7 @@ class FlipperClient {
 
     final commandId = frame.commandId;
     if (commandId == 0) {
-      LogService.log(
-        '[RPC] rx broadcast content=${frame.whichContent().name}',
-      );
+      LogService.log('[RPC] rx broadcast content=${frame.whichContent().name}');
       _broadcastCtrl.add(frame);
       return;
     }
@@ -1180,18 +1136,6 @@ class FlipperClient {
   void _onTransportDone() {
     if (_transport == null) return;
     unawaited(disconnect());
-  }
-
-  Future<void> _requestBlePermissions() async {
-    if (Platform.isIOS) {
-      await Permission.bluetooth.request();
-      return;
-    }
-    await [
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      Permission.locationWhenInUse,
-    ].request();
   }
 
   Future<void> _ensureCliPrompt() async {
@@ -1471,7 +1415,7 @@ abstract class _Transport {
     }
   }
 
-Future<void> rawWrite(Uint8List bytes);
+  Future<void> rawWrite(Uint8List bytes);
 
   Future<void> writeAscii(String text) =>
       write(Uint8List.fromList(ascii.encode(text)));
@@ -1487,7 +1431,7 @@ Future<void> rawWrite(Uint8List bytes);
     }
   }
 
-void onTransportFault(Object error) {
+  void onTransportFault(Object error) {
     if (_closed) return;
     _closed = true;
     LogService.log('[Transport] fault: $error');
@@ -1498,7 +1442,7 @@ void onTransportFault(Object error) {
     }
   }
 
-void onFaultExtra(Object error) {}
+  void onFaultExtra(Object error) {}
 
   Future<void> close() async {
     if (_closed) {
@@ -1519,7 +1463,7 @@ void onFaultExtra(Object error) {}
     }
   }
 
-Future<void> doClose();
+  Future<void> doClose();
 }
 
 class _Protocol {
@@ -1582,20 +1526,25 @@ class _FrameBuffer {
           return null;
         }
 
-        final payload =
-            Uint8List.fromList(_buffer.sublist(offset, offset + length));
+        final payload = Uint8List.fromList(
+          _buffer.sublist(offset, offset + length),
+        );
         _buffer.removeRange(0, offset + length);
 
         try {
           return Main.fromBuffer(payload);
         } catch (error) {
-          LogService.log('[FrameBuffer] protobuf parse error (length=$length): $error');
+          LogService.log(
+            '[FrameBuffer] protobuf parse error (length=$length): $error',
+          );
           return null;
         }
       }
 
       if (shift >= 35) {
-        LogService.log('[FrameBuffer] varint overflow, dropping first byte (0x${_buffer[0].toRadixString(16)})');
+        LogService.log(
+          '[FrameBuffer] varint overflow, dropping first byte (0x${_buffer[0].toRadixString(16)})',
+        );
         _buffer.removeAt(0);
         return null;
       }

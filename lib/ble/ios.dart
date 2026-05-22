@@ -1,0 +1,53 @@
+part of '../flipper_client.dart';
+
+class _IosBlePlatform extends _UniversalBlePlatformBase {
+  const _IosBlePlatform();
+
+  @override
+  Iterable<uble.ScanFilter?> get scanFilters => [
+    uble.ScanFilter(withServices: const [FlipperClient.bleServiceUuid]),
+  ];
+
+  @override
+  Future<void> requestPermissions() async {
+    try {
+      await uble.UniversalBle.requestPermissions();
+    } catch (e) {
+      LogService.log('[FlipperClient] iOS BLE permission request failed: $e');
+    }
+  }
+
+  @override
+  Future<List<BleDiscoveredDevice>> loadKnownDevices() async {
+    try {
+      final devices = await uble.UniversalBle.getSystemDevices(
+        withServices: const [FlipperClient.bleServiceUuid],
+      );
+      return devices
+          .map(BleDiscoveredDevice.new)
+          .where(includeDevice)
+          .toList(growable: false);
+    } catch (e) {
+      LogService.log('[FlipperClient] known BLE devices lookup failed: $e');
+      return const <BleDiscoveredDevice>[];
+    }
+  }
+
+  @override
+  bool includeDevice(BleDiscoveredDevice device) => true;
+
+  @override
+  Future<_Transport> openTransport(BleDiscoveredDevice device) {
+    return _IosBleTransport.create(device);
+  }
+}
+
+class _IosBleTransport extends _UniversalBleTransportBase {
+  _IosBleTransport._(super.device);
+
+  static Future<_IosBleTransport> create(BleDiscoveredDevice device) async {
+    final transport = _IosBleTransport._(device);
+    await transport._configure();
+    return transport;
+  }
+}
