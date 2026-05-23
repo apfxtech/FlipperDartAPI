@@ -1065,7 +1065,7 @@ class FlipperClient {
     _rawCtrl.add(chunk);
 
     if (_mode == FlipperMode.rpc) {
-      final frames = _frameBuffer.push(chunk);
+      final frames = _frameBuffer.push(chunk, onParseError: _onFrameParseError);
       if (frames.isEmpty) {
         LogService.log(
           '[RPC] rx ${chunk.length} bytes, buffering (pending frame)',
@@ -1125,6 +1125,16 @@ class FlipperClient {
         pending.complete();
       }
     }
+  }
+
+  void _onFrameParseError(Object error) {
+    final transport = _transport;
+    if (transport == null) return;
+    unawaited(
+      transport.restartRpc().catchError((e) {
+        LogService.log('[RPC] restart failed after parse error: $e');
+      }),
+    );
   }
 
   void _onTransportError(Object error, StackTrace stackTrace) {
@@ -1417,6 +1427,8 @@ abstract class _Transport {
 
   Future<void> rawWrite(Uint8List bytes);
 
+  Future<void> restartRpc() async {}
+
   Future<void> writeAscii(String text) =>
       write(Uint8List.fromList(ascii.encode(text)));
 
@@ -1490,11 +1502,14 @@ class _Protocol {
 class _FrameBuffer {
   final List<int> _buffer = [];
 
-  List<Main> push(List<int> chunk) {
+  List<Main> push(
+    List<int> chunk, {
+    void Function(Object error)? onParseError,
+  }) {
     _buffer.addAll(chunk);
     final messages = <Main>[];
     while (true) {
-      final frame = _tryParse();
+      final frame = _tryParse(onParseError);
       if (frame == null) return messages;
       messages.add(frame);
     }
@@ -1502,7 +1517,7 @@ class _FrameBuffer {
 
   void clear() => _buffer.clear();
 
-  Main? _tryParse() {
+  Main? _tryParse(void Function(Object error)? onParseError) {
     if (_buffer.isEmpty) return null;
 
     var length = 0;
@@ -1516,10 +1531,12 @@ class _FrameBuffer {
 
       if ((byte & 0x80) == 0) {
         if (length > 65536) {
+          final error = FormatException('Bad protobuf varint length: $length');
           LogService.log(
             '[FrameBuffer] bad varint length=$length (0x${_buffer[0].toRadixString(16)}), dropping first byte',
           );
           _buffer.removeAt(0);
+          onParseError?.call(error);
           return null;
         }
         if (_buffer.length < offset + length) {
@@ -1537,15 +1554,18 @@ class _FrameBuffer {
           LogService.log(
             '[FrameBuffer] protobuf parse error (length=$length): $error',
           );
+          onParseError?.call(error);
           return null;
         }
       }
 
       if (shift >= 35) {
+        const error = FormatException('Protobuf varint overflow');
         LogService.log(
           '[FrameBuffer] varint overflow, dropping first byte (0x${_buffer[0].toRadixString(16)})',
         );
         _buffer.removeAt(0);
+        onParseError?.call(error);
         return null;
       }
     }

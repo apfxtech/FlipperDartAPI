@@ -37,6 +37,8 @@ abstract class _UniversalBlePlatformBase implements _BlePlatform {
 
 abstract class _UniversalBleTransportBase extends _Transport {
   static const String overflowCharUuid = '19ed82ae-ed21-4c9d-4145-228e63fe0000';
+  static const String rpcStatusCharUuid =
+      '19ed82ae-ed21-4c9d-4145-228e64fe0000';
   static const Duration _serialSendWaitTimeout = Duration(milliseconds: 100);
 
   final BleDiscoveredDevice _device;
@@ -51,7 +53,8 @@ abstract class _UniversalBleTransportBase extends _Transport {
 
   String? _overflowSvcId;
   String? _overflowCharId;
-  bool _hasOverflowControl = false;
+  String? _rpcStatusSvcId;
+  String? _rpcStatusCharId;
 
   final List<_BlePendingSend> _txQueue = [];
   Completer<void>? _txDataSignal;
@@ -61,8 +64,10 @@ abstract class _UniversalBleTransportBase extends _Transport {
   int _budget = 0;
   int _budgetGen = 0;
   Completer<void>? _budgetSignal;
+  Completer<void>? _disconnectSignal;
 
   bool _senderRunning = false;
+  _BleConnectionPhase _connectionPhase = _BleConnectionPhase.disconnected;
 
   _UniversalBleTransportBase(this._device);
 
@@ -89,6 +94,8 @@ abstract class _UniversalBleTransportBase extends _Transport {
     String? rxChar;
     String? overflowSvc;
     String? overflowChar;
+    String? rpcStatusSvc;
+    String? rpcStatusChar;
     var txWithResponse = true;
     var rxUsesIndicate = false;
 
@@ -115,56 +122,42 @@ abstract class _UniversalBleTransportBase extends _Transport {
             overflowSvc = service.uuid;
             overflowChar = char.uuid;
           }
-        }
-      }
-    }
-
-    if (txSvc == null || txChar == null || rxSvc == null || rxChar == null) {
-      for (final service in services) {
-        for (final char in service.characteristics) {
-          if (txSvc == null &&
-              (char.properties.contains(uble.CharacteristicProperty.write) ||
-                  char.properties.contains(
-                    uble.CharacteristicProperty.writeWithoutResponse,
-                  ))) {
-            txSvc = service.uuid;
-            txChar = char.uuid;
-            txWithResponse = char.properties.contains(
-              uble.CharacteristicProperty.write,
-            );
-          }
-          if (rxSvc == null &&
-              char.properties.contains(uble.CharacteristicProperty.indicate)) {
-            rxSvc = service.uuid;
-            rxChar = char.uuid;
-            rxUsesIndicate = true;
-          } else if (rxSvc == null &&
-              char.properties.contains(uble.CharacteristicProperty.notify)) {
-            rxSvc = service.uuid;
-            rxChar = char.uuid;
-            rxUsesIndicate = false;
+          if (cid == rpcStatusCharUuid) {
+            rpcStatusSvc = service.uuid;
+            rpcStatusChar = char.uuid;
           }
         }
       }
     }
 
-    if (txSvc == null || txChar == null || rxSvc == null || rxChar == null) {
-      throw StateError('No suitable BLE characteristics');
+    final missing = <String>[
+      if (txSvc == null || txChar == null) 'tx($FlipperClient.bleTxUuid)',
+      if (rxSvc == null || rxChar == null) 'rx($FlipperClient.bleRxUuid)',
+      if (overflowSvc == null || overflowChar == null)
+        'overflow($overflowCharUuid)',
+      if (rpcStatusSvc == null || rpcStatusChar == null)
+        'rpcStatus($rpcStatusCharUuid)',
+    ];
+    if (missing.isNotEmpty) {
+      throw StateError(
+        'Missing Flipper BLE characteristics: ${missing.join(', ')}',
+      );
     }
 
-    _txSvcId = txSvc;
-    _txCharId = txChar;
-    _rxSvcId = rxSvc;
-    _rxCharId = rxChar;
+    _txSvcId = txSvc!;
+    _txCharId = txChar!;
+    _rxSvcId = rxSvc!;
+    _rxCharId = rxChar!;
     _txWithResponse = txWithResponse;
     _rxUsesIndicate = rxUsesIndicate;
     _bleChunkSize = (negotiatedMtu - 3).clamp(20, 512);
     _overflowSvcId = overflowSvc;
     _overflowCharId = overflowChar;
-    _hasOverflowControl = overflowSvc != null && overflowChar != null;
+    _rpcStatusSvcId = rpcStatusSvc;
+    _rpcStatusCharId = rpcStatusChar;
     LogService.log(
       '[BLE] mtu=$negotiatedMtu chunk=$_bleChunkSize '
-      'txWithResponse=$_txWithResponse overflowControl=$_hasOverflowControl',
+      'txWithResponse=$_txWithResponse overflowControl=true rpcStatus=true',
     );
   }
 
@@ -179,13 +172,20 @@ abstract class _UniversalBleTransportBase extends _Transport {
     uble.UniversalBle.onConnectionChange = (deviceId, isConnected, error) {
       if (deviceId != _device.device.deviceId) return;
       if (!isConnected) {
-        onTransportFault(StateError('BLE disconnected'));
+        final wasDisconnecting =
+            _connectionPhase == _BleConnectionPhase.disconnecting;
+        _markBleDisconnected();
+        if (!wasDisconnecting) {
+          onTransportFault(StateError('BLE disconnected'));
+        }
       }
     };
 
     uble.UniversalBle.onValueChange = (deviceId, charId, value, mtu) {
       _onValueChange(deviceId, charId, value, mtu);
     };
+
+    _connectionPhase = _BleConnectionPhase.connected;
 
     if (_rxUsesIndicate) {
       await uble.UniversalBle.subscribeIndications(
@@ -201,28 +201,18 @@ abstract class _UniversalBleTransportBase extends _Transport {
       );
     }
 
-    if (_hasOverflowControl) {
-      try {
-        await uble.UniversalBle.subscribeNotifications(
-          _device.device.deviceId,
-          _overflowSvcId!,
-          _overflowCharId!,
-        );
-        final initial = await uble.UniversalBle.read(
-          _device.device.deviceId,
-          _overflowSvcId!,
-          _overflowCharId!,
-        );
-        _applyOverflowValue(initial);
-      } catch (e) {
-        LogService.log('[BLE] overflow init failed: $e, disabling throttler');
-        _hasOverflowControl = false;
-      }
-    }
-
-    if (_hasOverflowControl) {
-      _startSender();
-    }
+    await uble.UniversalBle.subscribeNotifications(
+      _device.device.deviceId,
+      _overflowSvcId!,
+      _overflowCharId!,
+    );
+    final initial = await uble.UniversalBle.read(
+      _device.device.deviceId,
+      _overflowSvcId!,
+      _overflowCharId!,
+    );
+    _applyOverflowValue(initial);
+    _startSender();
   }
 
   void _onValueChange(
@@ -237,9 +227,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
       addBytes(value);
       return;
     }
-    if (_hasOverflowControl &&
-        _overflowCharId != null &&
-        lower == _overflowCharId!.toLowerCase()) {
+    if (lower == _overflowCharId!.toLowerCase()) {
       _applyOverflowValue(value);
     }
   }
@@ -261,11 +249,6 @@ abstract class _UniversalBleTransportBase extends _Transport {
     if (_closed) throw StateError('BLE transport closed');
     if (bytes.isEmpty) return;
 
-    if (!_hasOverflowControl) {
-      await _writeRawDirect(bytes);
-      return;
-    }
-
     final completer = Completer<void>();
     _txQueue.add(_BlePendingSend(bytes, completer));
     final sig = _txDataSignal;
@@ -273,24 +256,6 @@ abstract class _UniversalBleTransportBase extends _Transport {
     if (sig != null && !sig.isCompleted) sig.complete();
     _startSender();
     await completer.future;
-  }
-
-  Future<void> _writeRawDirect(Uint8List bytes) async {
-    var offset = 0;
-    while (offset < bytes.length) {
-      if (_closed) throw StateError('BLE transport closed');
-      final end = (offset + _bleChunkSize) > bytes.length
-          ? bytes.length
-          : offset + _bleChunkSize;
-      await uble.UniversalBle.write(
-        _device.device.deviceId,
-        _txSvcId,
-        _txCharId,
-        bytes.sublist(offset, end),
-        withoutResponse: !_txWithResponse,
-      );
-      offset = end;
-    }
   }
 
   void _startSender() {
@@ -494,6 +459,8 @@ abstract class _UniversalBleTransportBase extends _Transport {
     _txDataSignal = null;
     if (dataSignal != null && !dataSignal.isCompleted) dataSignal.complete();
     _failAllPending(error);
+    _markBleDisconnected();
+    _clearBleCallbacks();
   }
 
   @override
@@ -514,13 +481,73 @@ abstract class _UniversalBleTransportBase extends _Transport {
     _txDataSignal = null;
     if (dataSignal != null && !dataSignal.isCompleted) dataSignal.complete();
     _failAllPending(StateError('BLE transport closed'));
-    uble.UniversalBle.onConnectionChange = null;
-    uble.UniversalBle.onValueChange = null;
+    if (_connectionPhase == _BleConnectionPhase.disconnected) {
+      _clearBleCallbacks();
+      return;
+    }
+    final state = await _readConnectionState();
+    if (state == uble.BleConnectionState.disconnected) {
+      _markBleDisconnected();
+      _clearBleCallbacks();
+      return;
+    }
+    _connectionPhase = _BleConnectionPhase.disconnecting;
+    _disconnectSignal = Completer<void>();
     try {
       await uble.UniversalBle.disconnect(_device.device.deviceId);
-    } catch (_) {}
+      final stateAfterDisconnect = await _readConnectionState();
+      if (stateAfterDisconnect == uble.BleConnectionState.disconnected) {
+        _markBleDisconnected();
+      }
+      await _disconnectSignal!.future;
+    } catch (e) {
+      LogService.log('[BLE] disconnect failed: $e');
+    } finally {
+      _markBleDisconnected();
+      _clearBleCallbacks();
+    }
+  }
+
+  @override
+  Future<void> restartRpc() async {
+    final serviceId = _rpcStatusSvcId;
+    final charId = _rpcStatusCharId;
+    if (serviceId == null || charId == null || _closed) return;
+
+    await uble.UniversalBle.write(
+      _device.device.deviceId,
+      serviceId,
+      charId,
+      Uint8List(1),
+    );
+    LogService.log('[BLE] RPC restart requested');
+  }
+
+  Future<uble.BleConnectionState?> _readConnectionState() async {
+    try {
+      return await uble.UniversalBle.getConnectionState(
+        _device.device.deviceId,
+      );
+    } catch (e) {
+      LogService.log('[BLE] getConnectionState failed: $e');
+      return null;
+    }
+  }
+
+  void _markBleDisconnected() {
+    _connectionPhase = _BleConnectionPhase.disconnected;
+    final signal = _disconnectSignal;
+    _disconnectSignal = null;
+    if (signal != null && !signal.isCompleted) signal.complete();
+  }
+
+  void _clearBleCallbacks() {
+    uble.UniversalBle.onConnectionChange = null;
+    uble.UniversalBle.onValueChange = null;
   }
 }
+
+enum _BleConnectionPhase { disconnected, connected, disconnecting }
 
 class _BlePendingSend {
   _BlePendingSend(this.bytes, this.completer);
