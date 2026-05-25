@@ -39,9 +39,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
   static const String overflowCharUuid = '19ed82ae-ed21-4c9d-4145-228e63fe0000';
   static const String rpcStatusCharUuid =
       '19ed82ae-ed21-4c9d-4145-228e64fe0000';
-  static const Duration _serialSendWaitTimeout = Duration(milliseconds: 100);
-
-  final BleDiscoveredDevice _device;
+final BleDiscoveredDevice _device;
 
   late final String _txSvcId;
   late final String _txCharId;
@@ -386,9 +384,9 @@ abstract class _UniversalBleTransportBase extends _Transport {
         if (_closed || _budgetGen != gen || _txQueue.isEmpty) break;
         entry = _txQueue.first;
       } else {
-        final got = await _waitForDataWithTimeout(_serialSendWaitTimeout);
-        if (!got || _closed || _budgetGen != gen || _txQueue.isEmpty) break;
-        entry = _txQueue.first;
+        // BLE RPC is sequential (send → wait for response → next send).
+        // Waiting here for more commands to batch only adds latency with no benefit.
+        break;
       }
       firstRead = false;
 
@@ -440,20 +438,6 @@ abstract class _UniversalBleTransportBase extends _Transport {
     final completer = Completer<void>();
     _txDataSignal = completer;
     await completer.future;
-  }
-
-  Future<bool> _waitForDataWithTimeout(Duration timeout) async {
-    if (_txQueue.isNotEmpty) return true;
-    final completer = Completer<void>();
-    _txDataSignal = completer;
-    try {
-      await completer.future.timeout(timeout);
-      return true;
-    } on TimeoutException {
-      return false;
-    } catch (_) {
-      return false;
-    }
   }
 
   void _failAllPending(Object error) {
