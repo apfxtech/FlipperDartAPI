@@ -3,9 +3,6 @@ part of '../flipper_client.dart';
 class _MacosBlePlatform extends _UniversalBlePlatformBase {
   _MacosBlePlatform();
 
-  final Set<String> _verifiedDeviceIds = <String>{};
-  final Set<String> _rejectedProbeIds = <String>{};
-
   @override
   Iterable<uble.ScanFilter?> get scanFilters => [
     uble.ScanFilter(withServices: const [FlipperClient.bleServiceUuid]),
@@ -39,8 +36,6 @@ class _MacosBlePlatform extends _UniversalBlePlatformBase {
 
   @override
   bool includeDevice(BleDiscoveredDevice device) {
-    if (_verifiedDeviceIds.contains(device.id)) return true;
-
     final services = device.device.services.map((uuid) => uuid.toLowerCase());
     if (_hasFlipperService(services)) return true;
 
@@ -50,76 +45,10 @@ class _MacosBlePlatform extends _UniversalBlePlatformBase {
     return name.contains('flipper') || name.contains('flip_');
   }
 
-  @override
-  Future<List<BleDiscoveredDevice>> resolveScanResults(
-    Iterable<BleDiscoveredDevice> devices,
-  ) async {
-    final candidates = <BleDiscoveredDevice>[];
-    final seen = <String>{};
-    for (final device in devices) {
-      if (includeDevice(device)) continue;
-      if (_rejectedProbeIds.contains(device.id)) continue;
-      if (!seen.add(device.id)) continue;
-      if (!_shouldProbe(device)) continue;
-      candidates.add(device);
-    }
-
-    candidates.sort((a, b) => b.rssi.compareTo(a.rssi));
-    final resolved = <BleDiscoveredDevice>[];
-    for (final device in candidates.take(8)) {
-      if (await _probeFlipperService(device)) {
-        _verifiedDeviceIds.add(device.id);
-        resolved.add(device);
-      } else {
-        _rejectedProbeIds.add(device.id);
-      }
-    }
-    return resolved;
-  }
-
-  bool _shouldProbe(BleDiscoveredDevice device) {
-    if (device.device.services.isNotEmpty) return true;
-    final name = device.name;
-    return name == device.id || _looksLikeApplePeripheralId(name);
-  }
-
-  bool _looksLikeApplePeripheralId(String value) {
-    return RegExp(
-      r'^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$',
-    ).hasMatch(value);
-  }
-
   bool _hasFlipperService(Iterable<String> services) {
     return services
         .map((uuid) => uuid.toLowerCase())
         .contains(FlipperClient.bleServiceUuid);
-  }
-
-  Future<bool> _probeFlipperService(BleDiscoveredDevice device) async {
-    try {
-      LogService.log('[BLE] macOS probe ${device.id} name=${device.name}');
-      await uble.UniversalBle.connect(
-        device.device.deviceId,
-        timeout: const Duration(seconds: 4),
-      );
-      final services = await uble.UniversalBle.discoverServices(
-        device.device.deviceId,
-      );
-      final hasFlipper = _hasFlipperService(services.map((s) => s.uuid));
-      LogService.log(
-        '[BLE] macOS probe result ${device.id} '
-        'services=${services.map((s) => s.uuid).toList()} '
-        'flipper=$hasFlipper',
-      );
-      return hasFlipper;
-    } catch (e) {
-      LogService.log('[BLE] macOS probe failed ${device.id}: $e');
-      return false;
-    } finally {
-      try {
-        await uble.UniversalBle.disconnect(device.device.deviceId);
-      } catch (_) {}
-    }
   }
 
   @override
@@ -134,6 +63,57 @@ class _MacosBleTransport extends _UniversalBleTransportBase {
   static Future<_MacosBleTransport> create(BleDiscoveredDevice device) async {
     final transport = _MacosBleTransport._(device);
     await transport._configure();
+    // CoreBluetooth negotiates MTU automatically; requestMtu() returns 23 on macOS.
+    // Use a safe default that works without explicit negotiation.
+    if (transport._bleChunkSize < 100) {
+      transport._bleChunkSize = 182;
+      LogService.log('[BLE] macOS: MTU not negotiated, using chunk=182');
+    }
     return transport;
   }
+
+  // Fix 1: on macOS, calling connect() on an already-connected peripheral
+  // waits indefinitely for a DidConnect callback that never fires.
+  @override
+  Future<void> _connectDevice() async {
+    uble.BleConnectionState? state;
+    try {
+      state = await uble.UniversalBle.getConnectionState(_device.device.deviceId)
+          .timeout(const Duration(seconds: 2));
+    } catch (_) {
+      // If the check hangs or fails, fall through to connect() as normal.
+    }
+    if (state == uble.BleConnectionState.connected) {
+      LogService.log('[BLE] macOS: peripheral already connected, skipping connect()');
+      return;
+    }
+    await uble.UniversalBle.connect(_device.device.deviceId);
+  }
+
+  @override
+  Future<void> _postConnectDelay() =>
+      Future.delayed(const Duration(milliseconds: 600));
+
+  // Fix 2: subscribe to rpcStatus so firmware auto-starts RPC session.
+  @override
+  Future<void> _openExtra() async {
+    final svc = _rpcStatusSvcId;
+    final chr = _rpcStatusCharId;
+    if (svc == null || chr == null) return;
+    try {
+      await uble.UniversalBle.subscribeNotifications(
+        _device.device.deviceId,
+        svc,
+        chr,
+      ).timeout(const Duration(seconds: 4));
+      LogService.log('[BLE] macOS: subscribed to rpcStatus');
+    } catch (e) {
+      LogService.log('[BLE] macOS: rpcStatus subscribe failed (non-fatal): $e');
+    }
+  }
+
+  // Fix 3: writing to rpcStatus on macOS CoreBluetooth triggers an ATT error
+  // that tears the whole connection down.
+  @override
+  bool get _canWriteRpcStatus => false;
 }

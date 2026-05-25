@@ -49,7 +49,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
   late final String _rxCharId;
   late final bool _txWithResponse;
   late final bool _rxUsesIndicate;
-  late final int _bleChunkSize;
+  late int _bleChunkSize;
 
   String? _overflowSvcId;
   String? _overflowCharId;
@@ -71,8 +71,23 @@ abstract class _UniversalBleTransportBase extends _Transport {
 
   _UniversalBleTransportBase(this._device);
 
-  Future<void> _configure() async {
+  // Override in subclasses to inject a delay between connect and service discovery.
+  Future<void> _postConnectDelay() async {}
+
+  // Override to skip connect() if the peripheral is already connected (macOS).
+  Future<void> _connectDevice() async {
     await uble.UniversalBle.connect(_device.device.deviceId);
+  }
+
+  // Override to subscribe to extra characteristics after open (macOS rpcStatus).
+  Future<void> _openExtra() async {}
+
+  // Override to false on platforms where writing rpcStatus tears the link (macOS).
+  bool get _canWriteRpcStatus => true;
+
+  Future<void> _configure() async {
+    await _connectDevice();
+    await _postConnectDelay();
     int negotiatedMtu = 23;
     try {
       negotiatedMtu = await uble.UniversalBle.requestMtu(
@@ -212,6 +227,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
       _overflowCharId!,
     );
     _applyOverflowValue(initial);
+    await _openExtra();
     _startSender();
   }
 
@@ -513,6 +529,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
     final serviceId = _rpcStatusSvcId;
     final charId = _rpcStatusCharId;
     if (serviceId == null || charId == null || _closed) return;
+    if (!_canWriteRpcStatus) return;
 
     await uble.UniversalBle.write(
       _device.device.deviceId,
