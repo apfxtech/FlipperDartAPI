@@ -274,10 +274,15 @@ class FlipperClient {
   final _messageCtrl = StreamController<Main>.broadcast();
   final _broadcastCtrl = StreamController<Main>.broadcast();
   final _errorCtrl = StreamController<FlipperRpcException>.broadcast();
+  final _deviceNameCtrl = StreamController<String>.broadcast();
+  final _deviceInfoCompleteCtrl =
+      StreamController<Map<String, String>>.broadcast();
+  bool _deviceInfoFetched = false;
 
   final Map<String, FlipperDevice> _devices = {};
   final Map<int, _PendingRpc> _pendingRpc = {};
   final List<_QueuedRequest> _requestQueue = [];
+  final Map<String, String> _deviceInfoCache = {};
   final _frameBuffer = _FrameBuffer();
   final _utf8Decoder = const Utf8Decoder(allowMalformed: true);
 
@@ -319,6 +324,31 @@ class FlipperClient {
   List<FlipperDevice> listDevices() => devices;
 
   FlipperDevice? get connectedDevice => _connectedDevice;
+
+  Map<String, String> get deviceInfoCache =>
+      Map.unmodifiable(_deviceInfoCache);
+
+  Stream<String> get deviceNameStream => _deviceNameCtrl.stream;
+
+  Stream<Map<String, String>> get deviceInfoStream =>
+      _deviceInfoCompleteCtrl.stream;
+
+  /// Returns the device name from cached device info, or null if not yet known.
+  String? getName() =>
+      _deviceInfoCache['hardware_name'] ?? _deviceInfoCache['device_name'];
+
+  /// Returns the device name, waiting until it is received from the device.
+  Future<String> awaitName() {
+    final cached = getName();
+    if (cached != null) return Future.value(cached);
+    return deviceNameStream.first;
+  }
+
+  /// Returns the full device info map, waiting until the fetch is complete.
+  Future<Map<String, String>> awaitDeviceInfo() {
+    if (_deviceInfoFetched) return Future.value(deviceInfoCache);
+    return deviceInfoStream.first;
+  }
 
   FlipperMode get mode => _mode;
 
@@ -464,6 +494,8 @@ class FlipperClient {
   Future<void> _cleanupFailedConnect(_Transport? transport) async {
     _transport = null;
     _connectedDevice = null;
+    _deviceInfoCache.clear();
+    _deviceInfoFetched = false;
     _frameBuffer.clear();
 
     await _transportSub?.cancel();
@@ -483,6 +515,8 @@ class FlipperClient {
   Future<void> disconnect() async {
     final transport = _transport;
     _transport = null;
+    _deviceInfoCache.clear();
+    _deviceInfoFetched = false;
     _frameBuffer.clear();
 
     await _transportSub?.cancel();
@@ -1088,6 +1122,21 @@ class FlipperClient {
   void _routeFrame(Main frame) {
     _messageCtrl.add(frame);
 
+    if (frame.hasSystemDeviceInfoResponse()) {
+      final info = frame.systemDeviceInfoResponse;
+      final key = info.key.trim();
+      final value = info.value.trim();
+      if (key.isNotEmpty && value.isNotEmpty) {
+        _deviceInfoCache[key] = value;
+        if (key == 'hardware_name' || key == 'device_name') {
+          final name = getName();
+          if (name != null && !_deviceNameCtrl.isClosed) {
+            _deviceNameCtrl.add(name);
+          }
+        }
+      }
+    }
+
     final commandId = frame.commandId;
     if (commandId == 0) {
       LogService.log('[RPC] rx broadcast content=${frame.whichContent().name}');
@@ -1240,6 +1289,8 @@ class FlipperClient {
     await _messageCtrl.close();
     await _broadcastCtrl.close();
     await _errorCtrl.close();
+    await _deviceNameCtrl.close();
+    await _deviceInfoCompleteCtrl.close();
   }
 
   void _setMode(FlipperMode mode) {
@@ -1252,6 +1303,19 @@ class FlipperClient {
         connected: mode != FlipperMode.disconnected,
       ),
     );
+    if (mode == FlipperMode.rpc && getName() == null) {
+      unawaited(_autoFetchDeviceInfo());
+    }
+  }
+
+  Future<void> _autoFetchDeviceInfo() async {
+    try {
+      await deviceInfo(priority: FlipperRequestPriority.foreground);
+      _deviceInfoFetched = true;
+      if (!_deviceInfoCompleteCtrl.isClosed) {
+        _deviceInfoCompleteCtrl.add(deviceInfoCache);
+      }
+    } catch (_) {}
   }
 }
 
