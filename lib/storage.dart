@@ -139,6 +139,46 @@ extension FlipperStorageApi on FlipperClient {
     );
   }
 
+  // On modern Flipper firmware, `/int` is aliased onto the SD card, so
+  // `storageInfo("/int")` returns the SD card's total/free — not the actual
+  // footprint of files in the internal namespace. Use this instead to get the
+  // real used-bytes count via recursive directory walk.
+  Future<int> storageDu(
+    String path, {
+    Duration timeout = const Duration(seconds: 30),
+    FlipperRequestPriority priority = FlipperRequestPriority.foreground,
+  }) async {
+    var total = 0;
+    final queue = <String>[path];
+    while (queue.isNotEmpty) {
+      final dir = queue.removeLast();
+      FlipperRpcBatch<ListResponse> batch;
+      try {
+        batch = await storageList(
+          ListRequest(path: dir),
+          timeout: timeout,
+          priority: priority,
+        );
+      } catch (e) {
+        LogService.log('[StorageDu] list "$dir" failed: $e');
+        continue;
+      }
+      for (final response in batch.items) {
+        for (final entry in response.file) {
+          if (entry.type == File_FileType.DIR) {
+            final sub = dir.endsWith('/') ? '$dir${entry.name}' : '$dir/${entry.name}';
+            queue.add(sub);
+          } else {
+            LogService.log('[StorageDu] file "$dir/${entry.name}" size=${entry.size}');
+            total += entry.size;
+          }
+        }
+      }
+    }
+    LogService.log('[StorageDu] "$path" total=$total');
+    return total;
+  }
+
   Future<FlipperRpcBatch<TimestampResponse>> storageTimestamp(
     TimestampRequest request, {
     Duration timeout = const Duration(seconds: 8),
