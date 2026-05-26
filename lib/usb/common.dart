@@ -144,12 +144,14 @@ abstract class _SerialUsbTransportBase extends _Transport {
       addBytes(message.bytes);
     } else if (message is DesktopUsbWriteAck) {
       final pending = _inFlight.remove(message.seq);
-      if (pending == null || pending.isCompleted) return;
       if (message.error != null) {
-        pending.completeError(
-          StateError('Serial write failed: ${message.error}'),
-        );
+        final error = StateError('Serial write failed: ${message.error}');
+        if (pending != null && !pending.isCompleted) {
+          pending.completeError(error);
+        }
+        onTransportFault(error);
       } else {
+        if (pending == null || pending.isCompleted) return;
         pending.complete();
       }
     } else if (message is DesktopUsbFault) {
