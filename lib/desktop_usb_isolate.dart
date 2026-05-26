@@ -140,7 +140,7 @@ void desktopUsbIsolateEntry(DesktopUsbIsolateConfig config) {
     }
   });
 
-  readTimer = Timer.periodic(const Duration(milliseconds: 1), (_) {
+  readTimer = Timer.periodic(const Duration(milliseconds: 10), (_) {
     if (shuttingDown) return;
     try {
       final bytes = port.read(65536);

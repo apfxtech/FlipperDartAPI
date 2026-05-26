@@ -247,9 +247,17 @@ final BleDiscoveredDevice _device;
   }
 
   void _applyOverflowValue(List<int> value) {
-    if (value.length < 4) return;
-    final view = ByteData.view(Uint8List.fromList(value).buffer);
-    final remaining = view.getInt32(0, Endian.big);
+    final bytes = Uint8List.fromList(value);
+    final view = ByteData.view(bytes.buffer);
+    int remaining;
+    if (bytes.length >= 4) {
+      remaining = view.getUint32(0, Endian.big);
+    } else if (bytes.length >= 2) {
+      // Older Flipper firmware sends 2-byte uint16_t overflow counter.
+      remaining = view.getUint16(0, Endian.big);
+    } else {
+      return;
+    }
     _budget = remaining;
     _budgetGen += 1;
     LogService.log('[BLE] overflow remaining=$remaining (gen $_budgetGen)');
@@ -431,7 +439,25 @@ final BleDiscoveredDevice _device;
   Future<void> _waitForBudget() async {
     final completer = Completer<void>();
     _budgetSignal = completer;
-    await completer.future;
+    try {
+      await completer.future.timeout(const Duration(seconds: 5));
+    } on TimeoutException {
+      _budgetSignal = null;
+      // Firmware may have missed sending a notification — re-read to unblock.
+      if (!_closed && _overflowSvcId != null && _overflowCharId != null) {
+        try {
+          final value = await uble.UniversalBle.read(
+            _device.device.deviceId,
+            _overflowSvcId!,
+            _overflowCharId!,
+          );
+          _applyOverflowValue(value);
+          LogService.log('[BLE] overflow re-read after budget timeout');
+        } catch (e) {
+          LogService.log('[BLE] overflow re-read failed: $e');
+        }
+      }
+    }
   }
 
   Future<void> _waitForData() async {
