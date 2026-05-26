@@ -81,12 +81,10 @@ void desktopUsbIsolateEntry(DesktopUsbIsolateConfig config) {
   }
 
   var shuttingDown = false;
-  Timer? readTimer;
 
   void shutdown() {
     if (shuttingDown) return;
     shuttingDown = true;
-    readTimer?.cancel();
     try {
       port.close();
     } catch (_) {}
@@ -140,18 +138,25 @@ void desktopUsbIsolateEntry(DesktopUsbIsolateConfig config) {
     }
   });
 
-  readTimer = Timer.periodic(const Duration(milliseconds: 10), (_) {
-    if (shuttingDown) return;
-    try {
-      final bytes = port.read(65536);
-      if (bytes.isNotEmpty) {
-        config.eventPort.send(DesktopUsbBytes(Uint8List.fromList(bytes)));
+  // Blocking read loop: port.read(timeout: 5) returns as soon as data arrives
+  // (up to 5 ms wait), so response latency is much lower than timer polling.
+  // await Future.delayed(Duration.zero) yields to the event loop between reads
+  // so commandPort write requests can be processed without long delays.
+  Timer(Duration.zero, () async {
+    while (!shuttingDown) {
+      try {
+        final bytes = port.read(65536, timeout: 5);
+        if (bytes.isNotEmpty) {
+          config.eventPort.send(DesktopUsbBytes(Uint8List.fromList(bytes)));
+        }
+      } catch (e) {
+        if (!port.isOpen) {
+          config.eventPort.send(DesktopUsbFault('Port closed: $e'));
+          shutdown();
+          break;
+        }
       }
-    } catch (e) {
-      if (!port.isOpen) {
-        config.eventPort.send(DesktopUsbFault('Port closed: $e'));
-        shutdown();
-      }
+      await Future<void>.delayed(Duration.zero);
     }
   });
 }

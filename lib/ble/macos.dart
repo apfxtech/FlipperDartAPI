@@ -60,6 +60,8 @@ class _MacosBlePlatform extends _UniversalBlePlatformBase {
 class _MacosBleTransport extends _UniversalBleTransportBase {
   _MacosBleTransport._(super.device);
 
+  bool _wasAlreadyConnected = false;
+
   static Future<_MacosBleTransport> create(BleDiscoveredDevice device) async {
     final transport = _MacosBleTransport._(device);
     await transport._configure();
@@ -85,14 +87,19 @@ class _MacosBleTransport extends _UniversalBleTransportBase {
     }
     if (state == uble.BleConnectionState.connected) {
       LogService.log('[BLE] macOS: peripheral already connected, skipping connect()');
+      _wasAlreadyConnected = true;
       return;
     }
     await uble.UniversalBle.connect(_device.device.deviceId);
   }
 
+  // Skip the settle delay when the peripheral was already connected — the link
+  // is stable and CoreBluetooth does not need time to negotiate parameters.
   @override
   Future<void> _postConnectDelay() =>
-      Future.delayed(const Duration(milliseconds: 600));
+      _wasAlreadyConnected
+          ? Future.value()
+          : Future.delayed(const Duration(milliseconds: 600));
 
   // Fix 2: subscribe to rpcStatus so firmware auto-starts RPC session.
   @override

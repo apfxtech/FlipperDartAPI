@@ -1564,53 +1564,84 @@ class _Protocol {
 }
 
 class _FrameBuffer {
-  final List<int> _buffer = [];
+  static const _initialCapacity = 512;
+  Uint8List _buf = Uint8List(_initialCapacity);
+  int _writePos = 0;
+  int _readPos = 0;
+
+  void _makeRoom(int needed) {
+    if (_writePos + needed <= _buf.length) return;
+    // Compact: slide unconsumed data to the front.
+    if (_readPos > 0) {
+      final unread = _writePos - _readPos;
+      _buf.setRange(0, unread, _buf, _readPos);
+      _writePos = unread;
+      _readPos = 0;
+      if (_writePos + needed <= _buf.length) return;
+    }
+    // Grow.
+    var cap = _buf.length;
+    while (cap < _writePos + needed) {
+      cap *= 2;
+    }
+    final next = Uint8List(cap);
+    next.setRange(0, _writePos, _buf);
+    _buf = next;
+  }
 
   List<Main> push(
     List<int> chunk, {
     void Function(Object error)? onParseError,
   }) {
-    _buffer.addAll(chunk);
+    _makeRoom(chunk.length);
+    _buf.setRange(_writePos, _writePos + chunk.length, chunk);
+    _writePos += chunk.length;
+
     final messages = <Main>[];
     while (true) {
       final frame = _tryParse(onParseError);
-      if (frame == null) return messages;
+      if (frame == null) break;
       messages.add(frame);
     }
+    if (_readPos > 4096) {
+      final unread = _writePos - _readPos;
+      _buf.setRange(0, unread, _buf, _readPos);
+      _writePos = unread;
+      _readPos = 0;
+    }
+    return messages;
   }
 
-  void clear() => _buffer.clear();
+  void clear() {
+    _writePos = 0;
+    _readPos = 0;
+  }
 
   Main? _tryParse(void Function(Object error)? onParseError) {
-    if (_buffer.isEmpty) return null;
+    if (_readPos >= _writePos) return null;
 
     var length = 0;
     var shift = 0;
-    var offset = 0;
+    var offset = _readPos;
 
-    while (offset < _buffer.length) {
-      final byte = _buffer[offset++];
+    while (offset < _writePos) {
+      final byte = _buf[offset++];
       length |= (byte & 0x7F) << shift;
       shift += 7;
 
       if ((byte & 0x80) == 0) {
         if (length > 65536) {
-          final error = FormatException('Bad protobuf varint length: $length');
           LogService.log(
-            '[FrameBuffer] bad varint length=$length (0x${_buffer[0].toRadixString(16)}), dropping first byte',
+            '[FrameBuffer] bad varint length=$length (0x${_buf[_readPos].toRadixString(16)}), dropping first byte',
           );
-          _buffer.removeAt(0);
-          onParseError?.call(error);
+          _readPos += 1;
+          onParseError?.call(FormatException('Bad protobuf varint length: $length'));
           return null;
         }
-        if (_buffer.length < offset + length) {
-          return null;
-        }
+        if (_writePos < offset + length) return null;
 
-        final payload = Uint8List.fromList(
-          _buffer.sublist(offset, offset + length),
-        );
-        _buffer.removeRange(0, offset + length);
+        final payload = _buf.sublist(offset, offset + length);
+        _readPos = offset + length;
 
         try {
           return Main.fromBuffer(payload);
@@ -1624,12 +1655,11 @@ class _FrameBuffer {
       }
 
       if (shift >= 35) {
-        const error = FormatException('Protobuf varint overflow');
         LogService.log(
-          '[FrameBuffer] varint overflow, dropping first byte (0x${_buffer[0].toRadixString(16)})',
+          '[FrameBuffer] varint overflow, dropping first byte (0x${_buf[_readPos].toRadixString(16)})',
         );
-        _buffer.removeAt(0);
-        onParseError?.call(error);
+        _readPos += 1;
+        onParseError?.call(const FormatException('Protobuf varint overflow'));
         return null;
       }
     }
