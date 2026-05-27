@@ -53,9 +53,8 @@ class _NativeMacosOps implements _BleOps {
       _onConn = cb;
 
   @override
-  set onValueChange(
-    void Function(String, String, Uint8List, int?)? cb,
-  ) => _onValue = cb;
+  set onValueChange(void Function(String, String, Uint8List, int?)? cb) =>
+      _onValue = cb;
 
   @override
   Future<void> connect(String deviceId) =>
@@ -72,10 +71,9 @@ class _NativeMacosOps implements _BleOps {
 
   @override
   Future<List<_BleService>> discoverServices(String deviceId) async {
-    final raw = await _mc.invokeMethod<List<dynamic>>(
-      'discoverServices',
-      {'deviceId': deviceId},
-    );
+    final raw = await _mc.invokeMethod<List<dynamic>>('discoverServices', {
+      'deviceId': deviceId,
+    });
     return (raw ?? []).map((svc) {
       final s = svc as Map<Object?, Object?>;
       final chars = (s['characteristics'] as List<dynamic>).map((ch) {
@@ -148,10 +146,9 @@ class _NativeMacosOps implements _BleOps {
   @override
   Future<_BleConnState?> getConnectionState(String deviceId) async {
     try {
-      final s = await _mc.invokeMethod<String>(
-        'getConnectionState',
-        {'deviceId': deviceId},
-      );
+      final s = await _mc.invokeMethod<String>('getConnectionState', {
+        'deviceId': deviceId,
+      });
       return switch (s) {
         'connected' => _BleConnState.connected,
         'connecting' => _BleConnState.connecting,
@@ -239,6 +236,12 @@ class _MacosBleTransport extends _UniversalBleTransportBase {
     return transport;
   }
 
+  @override
+  bool _txUsesWriteWithResponse(_BleChar char) {
+    if (char.canWriteNoRsp) return false;
+    return char.canWrite;
+  }
+
   // Fix: subscribe to rpcStatus so firmware auto-starts RPC session on macOS.
   @override
   Future<void> _openExtra() async {
@@ -246,11 +249,9 @@ class _MacosBleTransport extends _UniversalBleTransportBase {
     final chr = _rpcStatusCharId;
     if (svc == null || chr == null) return;
     try {
-      await _ops.subscribeNotifications(
-        _device.device.deviceId,
-        svc,
-        chr,
-      ).timeout(const Duration(seconds: 4));
+      await _ops
+          .subscribeNotifications(_device.device.deviceId, svc, chr)
+          .timeout(const Duration(seconds: 4));
       LogService.log('[BLE] macOS: subscribed to rpcStatus');
     } catch (e) {
       LogService.log('[BLE] macOS: rpcStatus subscribe failed (non-fatal): $e');

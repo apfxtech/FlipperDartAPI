@@ -68,11 +68,10 @@ abstract class _BleOps {
 
 class _UniversalBleOps implements _BleOps {
   @override
-  set onConnectionChange(
-    void Function(String, bool, String?)? cb,
-  ) {
-    uble.UniversalBle.onConnectionChange =
-        cb == null ? null : (did, conn, err) => cb(did, conn, err?.toString());
+  set onConnectionChange(void Function(String, bool, String?)? cb) {
+    uble.UniversalBle.onConnectionChange = cb == null
+        ? null
+        : (did, conn, err) => cb(did, conn, err?.toString());
   }
 
   @override
@@ -81,8 +80,7 @@ class _UniversalBleOps implements _BleOps {
   }
 
   @override
-  Future<void> connect(String deviceId) =>
-      uble.UniversalBle.connect(deviceId);
+  Future<void> connect(String deviceId) => uble.UniversalBle.connect(deviceId);
 
   @override
   Future<int> requestMtu(String deviceId, int mtu) =>
@@ -201,8 +199,7 @@ abstract class _UniversalBlePlatformBase implements _BlePlatform {
 // ── Base BLE transport ───────────────────────────────────────────────────────
 
 abstract class _UniversalBleTransportBase extends _Transport {
-  static const String overflowCharUuid =
-      '19ed82ae-ed21-4c9d-4145-228e63fe0000';
+  static const String overflowCharUuid = '19ed82ae-ed21-4c9d-4145-228e63fe0000';
   static const String rpcStatusCharUuid =
       '19ed82ae-ed21-4c9d-4145-228e64fe0000';
 
@@ -254,6 +251,8 @@ abstract class _UniversalBleTransportBase extends _Transport {
   // Override to false on platforms where writing rpcStatus tears the link (macOS).
   bool get _canWriteRpcStatus => true;
 
+  bool _txUsesWriteWithResponse(_BleChar char) => char.canWrite;
+
   Future<void> _configure() async {
     await _connectDevice();
     await _postConnectDelay();
@@ -286,7 +285,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
           if (cid == FlipperClient.bleTxUuid) {
             txSvc = service.uuid;
             txChar = char.uuid;
-            txWithResponse = char.canWrite;
+            txWithResponse = _txUsesWriteWithResponse(char);
           }
           if (cid == FlipperClient.bleRxUuid) {
             rxSvc = service.uuid;
@@ -352,9 +351,12 @@ abstract class _UniversalBleTransportBase extends _Transport {
       if (!isConnected) {
         final wasDisconnecting =
             _connectionPhase == _BleConnectionPhase.disconnecting;
-        _markBleDisconnected();
+        final reason = error == null || error.trim().isEmpty
+            ? 'backend connectionChange disconnected without error'
+            : 'backend connectionChange disconnected: $error';
+        _markBleDisconnected(reason);
         if (!wasDisconnecting) {
-          onTransportFault(StateError('BLE disconnected'));
+          onTransportFault(FlipperTransportError('BLE $reason'));
         }
       }
     };
@@ -462,7 +464,9 @@ abstract class _UniversalBleTransportBase extends _Transport {
           await _sendMessage(pending.bytes);
           if (!pending.completer.isCompleted) pending.completer.complete();
         } catch (e) {
-          if (!pending.completer.isCompleted) pending.completer.completeError(e);
+          if (!pending.completer.isCompleted) {
+            pending.completer.completeError(e);
+          }
           if (_closed) break;
           onTransportFault(e);
           break;
@@ -548,7 +552,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
     _txDataSignal = null;
     if (dataSignal != null && !dataSignal.isCompleted) dataSignal.complete();
     _failAllPending(error);
-    _markBleDisconnected();
+    _markBleDisconnected('transport fault: $error');
     _clearBleCallbacks();
   }
 
@@ -571,31 +575,37 @@ abstract class _UniversalBleTransportBase extends _Transport {
     if (dataSignal != null && !dataSignal.isCompleted) dataSignal.complete();
     _failAllPending(StateError('BLE transport closed'));
     if (_connectionPhase == _BleConnectionPhase.disconnected) {
+      LogService.log('[BLE] already disconnected before close');
       _clearBleCallbacks();
       return;
     }
     final state = await _readConnectionState();
     if (state == _BleConnState.disconnected) {
-      _markBleDisconnected();
+      _markBleDisconnected(
+        'close requested; backend state already disconnected',
+      );
       _clearBleCallbacks();
       return;
     }
+    LogService.log('[BLE] close requested; disconnecting device');
     _connectionPhase = _BleConnectionPhase.disconnecting;
     _disconnectSignal = Completer<void>();
     try {
       await _ops.disconnect(_device.device.deviceId);
       final stateAfterDisconnect = await _readConnectionState();
       if (stateAfterDisconnect == _BleConnState.disconnected) {
-        _markBleDisconnected();
+        _markBleDisconnected('close requested; backend confirmed disconnected');
       }
       await _disconnectSignal!.future.timeout(
         const Duration(seconds: 5),
-        onTimeout: () {},
+        onTimeout: () {
+          LogService.log('[BLE] disconnect event timeout after close request');
+        },
       );
     } catch (e) {
       LogService.log('[BLE] disconnect failed: $e');
     } finally {
-      _markBleDisconnected();
+      _markBleDisconnected('close cleanup finished');
       _clearBleCallbacks();
     }
   }
@@ -615,7 +625,12 @@ abstract class _UniversalBleTransportBase extends _Transport {
     return _ops.getConnectionState(_device.device.deviceId);
   }
 
-  void _markBleDisconnected() {
+  void _markBleDisconnected(String reason) {
+    if (_connectionPhase != _BleConnectionPhase.disconnected) {
+      LogService.log('[BLE] state -> disconnected: $reason');
+    } else {
+      LogService.log('[BLE] remains disconnected: $reason');
+    }
     _connectionPhase = _BleConnectionPhase.disconnected;
     final signal = _disconnectSignal;
     _disconnectSignal = null;

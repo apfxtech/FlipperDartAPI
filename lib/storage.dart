@@ -8,7 +8,8 @@ extension FlipperStorageApi on FlipperClient {
   }) {
     return callRpc(
       Main(storageListRequest: request),
-      (frame) => frame.hasStorageListResponse() ? frame.storageListResponse : null,
+      (frame) =>
+          frame.hasStorageListResponse() ? frame.storageListResponse : null,
       timeout: timeout,
       priority: priority,
     );
@@ -21,7 +22,8 @@ extension FlipperStorageApi on FlipperClient {
   }) {
     return callRpc(
       Main(storageReadRequest: request),
-      (frame) => frame.hasStorageReadResponse() ? frame.storageReadResponse : null,
+      (frame) =>
+          frame.hasStorageReadResponse() ? frame.storageReadResponse : null,
       timeout: timeout,
       priority: priority,
     );
@@ -84,7 +86,8 @@ extension FlipperStorageApi on FlipperClient {
   }) {
     return callRpc(
       Main(storageStatRequest: request),
-      (frame) => frame.hasStorageStatResponse() ? frame.storageStatResponse : null,
+      (frame) =>
+          frame.hasStorageStatResponse() ? frame.storageStatResponse : null,
       timeout: timeout,
       priority: priority,
     );
@@ -97,7 +100,8 @@ extension FlipperStorageApi on FlipperClient {
   }) {
     return callRpc(
       Main(storageInfoRequest: request),
-      (frame) => frame.hasStorageInfoResponse() ? frame.storageInfoResponse : null,
+      (frame) =>
+          frame.hasStorageInfoResponse() ? frame.storageInfoResponse : null,
       timeout: timeout,
       priority: priority,
     );
@@ -166,10 +170,14 @@ extension FlipperStorageApi on FlipperClient {
       for (final response in batch.items) {
         for (final entry in response.file) {
           if (entry.type == File_FileType.DIR) {
-            final sub = dir.endsWith('/') ? '$dir${entry.name}' : '$dir/${entry.name}';
+            final sub = dir.endsWith('/')
+                ? '$dir${entry.name}'
+                : '$dir/${entry.name}';
             queue.add(sub);
           } else {
-            LogService.log('[StorageDu] file "$dir/${entry.name}" size=${entry.size}');
+            LogService.log(
+              '[StorageDu] file "$dir/${entry.name}" size=${entry.size}',
+            );
             total += entry.size;
           }
         }
@@ -199,46 +207,49 @@ extension FlipperStorageApi on FlipperClient {
     List<int> data, {
     void Function(double progress)? onProgress,
     Duration timeout = const Duration(seconds: 60),
-    FlipperRequestPriority priority = FlipperRequestPriority.background,
+    FlipperRequestPriority priority = FlipperRequestPriority.foreground,
   }) async {
     final total = data.length;
     final chunkSize = _transport?.storageChunkSize ?? 512;
-    final totalFrames =
-        total == 0 ? 1 : ((total + chunkSize - 1) ~/ chunkSize);
+    final totalFrames = total == 0 ? 1 : ((total + chunkSize - 1) ~/ chunkSize);
     LogService.log(
       '[Storage] write "$path": ${total}B, $totalFrames frames, chunk=$chunkSize',
     );
 
-    await callRpcFramesMulti(
-      (sendFrame) async {
-        var offset = 0;
-        var frameIndex = 0;
-        while (true) {
-          final end =
-              (offset + chunkSize) > total ? total : (offset + chunkSize);
-          final chunk =
-              offset == end ? const <int>[] : data.sublist(offset, end);
-          final hasNext = end < total;
+    try {
+      await callRpcFramesMulti(
+        (sendFrame) async {
+          var offset = 0;
+          var frameIndex = 0;
+          while (true) {
+            final end = (offset + chunkSize) > total
+                ? total
+                : (offset + chunkSize);
+            final chunk = offset == end
+                ? const <int>[]
+                : data.sublist(offset, end);
+            final hasNext = end < total;
 
-          final req = WriteRequest()
-            ..path = path
-            ..ensureFile().data = chunk;
+            final req = WriteRequest()
+              ..path = path
+              ..ensureFile().data = chunk;
 
-          await sendFrame(Main(
-            hasNext: hasNext,
-            storageWriteRequest: req,
-          ));
+            await sendFrame(Main(hasNext: hasNext, storageWriteRequest: req));
 
-          offset = end;
-          frameIndex++;
-          if (total > 0) onProgress?.call(offset / total);
-          if (!hasNext) break;
-        }
-        LogService.log('[Storage] $frameIndex frames sent, awaiting ACK');
-      },
-      timeout: timeout,
-      priority: priority,
-    );
+            offset = end;
+            frameIndex++;
+            if (total > 0) onProgress?.call(offset / total);
+            if (!hasNext) break;
+          }
+          LogService.log('[Storage] $frameIndex frames sent, awaiting ACK');
+        },
+        timeout: timeout,
+        priority: priority,
+      );
+    } catch (e) {
+      LogService.log('[Storage] write "$path" failed while awaiting ACK: $e');
+      rethrow;
+    }
 
     onProgress?.call(1.0);
     LogService.log('[Storage] write "$path" complete');

@@ -47,6 +47,7 @@ public final class FlipperBlePlugin: NSObject, FlutterPlugin {
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var pstate: [UUID: PeripheralState] = [:]
     private var pendingConnects: [UUID: FlutterResult] = [:]
+    private var pendingDisconnectReasons: [UUID: String] = [:]
     // UUIDs we are scanning for to satisfy a connect() call
     private var connectScanTargets: Set<UUID> = []
     private var eventSink: FlutterEventSink?
@@ -222,6 +223,7 @@ public final class FlipperBlePlugin: NSObject, FlutterPlugin {
         case "disconnect":
             if let id = args["deviceId"] as? String, let p = peripheral(for: id) {
                 pstate.removeValue(forKey: p.identifier)
+                pendingDisconnectReasons[p.identifier] = "Disconnect requested by Dart"
                 central.cancelPeripheralConnection(p)
             }
             result(nil)
@@ -285,10 +287,18 @@ public final class FlipperBlePlugin: NSObject, FlutterPlugin {
             let noRsp = args["withoutResponse"] as? Bool ?? false
             let s = st(p)
             if noRsp {
+                guard ch.properties.contains(.writeWithoutResponse) else {
+                    result(FlutterError(code: "WRITE_UNSUPPORTED", message: "Char \(chr) does not support writeWithoutResponse", details: nil))
+                    return
+                }
                 // Queue and drain; peripheralIsReady resumes if buffer was full
                 s.noRspQueue.append((ch, raw.data, result))
                 drainNoRspQueue(p)
             } else {
+                guard ch.properties.contains(.write) else {
+                    result(FlutterError(code: "WRITE_UNSUPPORTED", message: "Char \(chr) does not support write", details: nil))
+                    return
+                }
                 var q = s.rspQueue[ch.uuid] ?? []
                 let wasEmpty = q.isEmpty
                 q.append((raw.data, result))
@@ -384,10 +394,13 @@ extension FlipperBlePlugin: CBCentralManagerDelegate {
         }
         // Discard queued GATT operations — they're no longer valid
         pstate.removeValue(forKey: id)
+        let message = pendingDisconnectReasons.removeValue(forKey: id)
+            ?? error?.localizedDescription
+            ?? "Unexpected peripheral disconnect without CoreBluetooth error"
         emit(["type": "connectionChange",
               "deviceId": id.uuidString,
               "connected": false,
-              "error": error?.localizedDescription as Any])
+              "error": message])
     }
 }
 

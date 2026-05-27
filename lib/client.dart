@@ -325,8 +325,7 @@ class FlipperClient {
 
   FlipperDevice? get connectedDevice => _connectedDevice;
 
-  Map<String, String> get deviceInfoCache =>
-      Map.unmodifiable(_deviceInfoCache);
+  Map<String, String> get deviceInfoCache => Map.unmodifiable(_deviceInfoCache);
 
   Stream<String> get deviceNameStream => _deviceNameCtrl.stream;
 
@@ -492,6 +491,7 @@ class FlipperClient {
   }
 
   Future<void> _cleanupFailedConnect(_Transport? transport) async {
+    LogService.log('[FlipperClient] state -> disconnected: connect failed');
     _transport = null;
     _connectedDevice = null;
     _deviceInfoCache.clear();
@@ -514,6 +514,10 @@ class FlipperClient {
 
   Future<void> disconnect() async {
     final transport = _transport;
+    LogService.log(
+      '[FlipperClient] state -> disconnected: disconnect requested'
+      '${transport == null ? ' (no active transport)' : ''}',
+    );
     _transport = null;
     _switchToRpcFuture = null;
     _deviceInfoCache.clear();
@@ -745,30 +749,42 @@ class FlipperClient {
 
     final pending = _PendingRpc(commandId);
     _pendingRpc[commandId] = pending;
-    pending.armTimeout(timeout, () {
+    void armTimeout() {
+      pending.armTimeout(timeout, () {
+        _pendingRpc.remove(commandId);
+        _removeQueuedCommand(commandId, 'RPC timeout before TX');
+        if (_activeMultiFrameGroup == commandId) {
+          _activeMultiFrameGroup = null;
+          _signalWorker();
+        }
+        pending.completeError(
+          TimeoutException(
+            'RPC timeout for commandId=$commandId '
+            'after ${timeout.inSeconds}s framesReceived=${pending.frames.length}',
+          ),
+        );
+      });
+    }
+
+    void failPending(Object error) {
       _pendingRpc.remove(commandId);
       if (_activeMultiFrameGroup == commandId) {
         _activeMultiFrameGroup = null;
         _signalWorker();
       }
-      pending.completeError(
-        TimeoutException('RPC timeout for commandId=$commandId'),
-      );
-    });
+      pending.cancelTimeout();
+      pending.completeError(error);
+    }
 
     _enqueueRequest(
       _QueuedRequest(
         frame: request,
         priority: priority,
         seq: _requestSeq++,
+        onSent: armTimeout,
         onError: (error) {
           if (_pendingRpc.remove(commandId) != null) {
-            pending.cancelTimeout();
-            if (_activeMultiFrameGroup == commandId) {
-              _activeMultiFrameGroup = null;
-              _signalWorker();
-            }
-            pending.completeError(error);
+            failPending(error);
           }
         },
       ),
@@ -793,18 +809,41 @@ class FlipperClient {
     final commandId = nextCommandId();
     final pending = _PendingRpc(commandId);
     _pendingRpc[commandId] = pending;
-    pending.armTimeout(timeout, () {
+    var finalFrameSent = false;
+    var timeoutArmed = false;
+
+    void armOrRearmTimeout() {
+      if (timeoutArmed) {
+        pending.rearmTimeout();
+        return;
+      }
+      timeoutArmed = true;
+      pending.armTimeout(timeout, () {
+        _pendingRpc.remove(commandId);
+        _removeQueuedCommand(commandId, 'multi-frame RPC timeout before TX');
+        if (_activeMultiFrameGroup == commandId) {
+          _activeMultiFrameGroup = null;
+          _signalWorker();
+        }
+        pending.completeError(
+          TimeoutException(
+            'Multi-frame RPC timeout waiting for ACK commandId=$commandId '
+            'after ${timeout.inSeconds}s finalFrameSent=$finalFrameSent '
+            'queued=${_requestQueue.length} pending=${_pendingRpc.keys.toList()}',
+          ),
+        );
+      });
+    }
+
+    void failPending(Object error) {
       _pendingRpc.remove(commandId);
       if (_activeMultiFrameGroup == commandId) {
         _activeMultiFrameGroup = null;
         _signalWorker();
       }
-      pending.completeError(
-        TimeoutException('Multi-frame RPC timeout for commandId=$commandId'),
-      );
-    });
-
-    var finalFrameSent = false;
+      pending.cancelTimeout();
+      pending.completeError(error);
+    }
 
     Future<void> sendFrame(Main frame) async {
       frame.commandId = commandId;
@@ -817,7 +856,7 @@ class FlipperClient {
           seq: _requestSeq++,
           onSent: () {
             if (wasFinal) finalFrameSent = true;
-            pending.rearmTimeout();
+            armOrRearmTimeout();
             if (!completer.isCompleted) completer.complete();
           },
           onError: (error) {
@@ -836,22 +875,16 @@ class FlipperClient {
           _activeMultiFrameGroup = null;
           _signalWorker();
         }
-        _pendingRpc.remove(commandId);
-        pending.completeError(e);
+        failPending(e);
         rethrow;
       }
 
       if (!finalFrameSent) {
-        if (_activeMultiFrameGroup == commandId) {
-          _activeMultiFrameGroup = null;
-          _signalWorker();
-        }
-        _pendingRpc.remove(commandId);
         final err = StateError(
           'Multi-frame body completed without sending a final frame '
           '(hasNext=false) for commandId=$commandId',
         );
-        pending.completeError(err);
+        failPending(err);
         throw err;
       }
 
@@ -922,6 +955,17 @@ class FlipperClient {
     _signalWorker();
   }
 
+  void _removeQueuedCommand(int commandId, String reason) {
+    final before = _requestQueue.length;
+    _requestQueue.removeWhere((r) => r.frame.commandId == commandId);
+    final removed = before - _requestQueue.length;
+    if (removed > 0) {
+      LogService.log(
+        '[RPC] removed $removed queued frame(s) for cmdId=$commandId: $reason',
+      );
+    }
+  }
+
   void _signalWorker() {
     final signal = _queueSignal;
     if (signal != null && !signal.isCompleted) {
@@ -987,8 +1031,6 @@ class FlipperClient {
           if (frame.commandId != 0) {
             if (frame.hasNext) {
               _activeMultiFrameGroup = frame.commandId;
-            } else if (_activeMultiFrameGroup == frame.commandId) {
-              _activeMultiFrameGroup = null;
             }
           }
           request.markSent();
@@ -1163,24 +1205,28 @@ class FlipperClient {
     LogService.log(
       '[RPC] rx frame cmdId=$commandId hasNext=${frame.hasNext} '
       'status=${frame.commandStatus.name} '
-      'content=${frame.whichContent().name}',
+      'content=${frame.whichContent().name} '
+      'frameN=${pending.frames.length + 1}',
     );
     pending.add(frame);
 
-    if (!frame.hasNext) {
-      _pendingRpc.remove(commandId);
-      pending.cancelTimeout();
-      if (_activeMultiFrameGroup == commandId) {
-        _activeMultiFrameGroup = null;
-        _signalWorker();
-      }
-      final error = _exceptionFromResponse(frame);
-      if (error != null) {
-        if (!_errorCtrl.isClosed) _errorCtrl.add(error);
-        pending.completeError(error);
-      } else {
-        pending.complete();
-      }
+    if (frame.hasNext) {
+      pending.rearmTimeout();
+      return;
+    }
+
+    _pendingRpc.remove(commandId);
+    pending.cancelTimeout();
+    if (_activeMultiFrameGroup == commandId) {
+      _activeMultiFrameGroup = null;
+      _signalWorker();
+    }
+    final error = _exceptionFromResponse(frame);
+    if (error != null) {
+      if (!_errorCtrl.isClosed) _errorCtrl.add(error);
+      pending.completeError(error);
+    } else {
+      pending.complete();
     }
   }
 
@@ -1197,11 +1243,17 @@ class FlipperClient {
   void _onTransportError(Object error, StackTrace stackTrace) {
     LogService.log('[FlipperClient] transport error: $error');
     if (_transport == null) return;
+    LogService.log(
+      '[FlipperClient] state -> disconnected: transport stream error',
+    );
     unawaited(disconnect());
   }
 
   void _onTransportDone() {
     if (_transport == null) return;
+    LogService.log(
+      '[FlipperClient] state -> disconnected: transport stream closed',
+    );
     unawaited(disconnect());
   }
 
@@ -1434,6 +1486,15 @@ class _TransportPendingWrite {
   _TransportPendingWrite(this.bytes, this.completer);
 }
 
+class FlipperTransportError implements Exception {
+  final String message;
+
+  FlipperTransportError(this.message);
+
+  @override
+  String toString() => message;
+}
+
 abstract class _Transport {
   final _bytesCtrl = StreamController<List<int>>.broadcast();
   final List<_TransportPendingWrite> _writeQueue = [];
@@ -1644,7 +1705,9 @@ class _FrameBuffer {
             '[FrameBuffer] bad varint length=$length (0x${_buf[_readPos].toRadixString(16)}), dropping first byte',
           );
           _readPos += 1;
-          onParseError?.call(FormatException('Bad protobuf varint length: $length'));
+          onParseError?.call(
+            FormatException('Bad protobuf varint length: $length'),
+          );
           return null;
         }
         if (_writePos < offset + length) return null;
