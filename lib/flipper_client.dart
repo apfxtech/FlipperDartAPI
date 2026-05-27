@@ -31,6 +31,7 @@ part 'usb/macos.dart';
 part 'usb/windows.dart';
 part 'system.dart';
 part 'storage.dart';
+part 'watch.dart';
 part 'app.dart';
 part 'gui.dart';
 part 'gpio.dart';
