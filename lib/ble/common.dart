@@ -68,6 +68,8 @@ final BleDiscoveredDevice _device;
   bool _senderRunning = false;
   _BleConnectionPhase _connectionPhase = _BleConnectionPhase.disconnected;
 
+  static _UniversalBleTransportBase? _activeTransport;
+
   _UniversalBleTransportBase(this._device);
 
   // Override in subclasses to inject a delay between connect and service discovery.
@@ -185,6 +187,7 @@ final BleDiscoveredDevice _device;
 
   @override
   Future<void> open() async {
+    _activeTransport = this;
     uble.UniversalBle.onConnectionChange = (deviceId, isConnected, error) {
       if (deviceId != _device.device.deviceId) return;
       if (!isConnected) {
@@ -431,7 +434,10 @@ final BleDiscoveredDevice _device;
       if (stateAfterDisconnect == uble.BleConnectionState.disconnected) {
         _markBleDisconnected();
       }
-      await _disconnectSignal!.future;
+      await _disconnectSignal!.future.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () {},
+      );
     } catch (e) {
       LogService.log('[BLE] disconnect failed: $e');
     } finally {
@@ -475,8 +481,11 @@ final BleDiscoveredDevice _device;
   }
 
   void _clearBleCallbacks() {
-    uble.UniversalBle.onConnectionChange = null;
-    uble.UniversalBle.onValueChange = null;
+    if (_activeTransport == this) {
+      _activeTransport = null;
+      uble.UniversalBle.onConnectionChange = null;
+      uble.UniversalBle.onValueChange = null;
+    }
   }
 }
 

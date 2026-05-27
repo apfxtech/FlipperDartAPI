@@ -515,6 +515,7 @@ class FlipperClient {
   Future<void> disconnect() async {
     final transport = _transport;
     _transport = null;
+    _switchToRpcFuture = null;
     _deviceInfoCache.clear();
     _deviceInfoFetched = false;
     _frameBuffer.clear();
@@ -564,8 +565,10 @@ class FlipperClient {
     final transport = _requireTransport();
     if (_mode == FlipperMode.rpc) return;
     if (!transport.supportsCli) {
-      _setMode(FlipperMode.rpc);
-      _signalWorker();
+      if (_transport == transport) {
+        _setMode(FlipperMode.rpc);
+        _signalWorker();
+      }
       return;
     }
 
@@ -596,8 +599,10 @@ class FlipperClient {
     await Future<void>.delayed(const Duration(milliseconds: 150));
     _frameBuffer.clear();
     LogService.log('[RPC] mode switched to RPC');
-    _setMode(FlipperMode.rpc);
-    _signalWorker();
+    if (_transport == transport) {
+      _setMode(FlipperMode.rpc);
+      _signalWorker();
+    }
   }
 
   Future<void> enterRpcMode() => switchToRpcMode();
@@ -1014,6 +1019,9 @@ class FlipperClient {
         queued.fail(StateError('Worker stopped'));
       }
       _requestQueue.clear();
+      if (_transport != null) {
+        _startWorker();
+      }
     }
   }
 
@@ -1294,6 +1302,7 @@ class FlipperClient {
   }
 
   void _setMode(FlipperMode mode) {
+    if (_mode == mode) return;
     _mode = mode;
     _modeCtrl.add(mode);
     _connectionCtrl.add(
