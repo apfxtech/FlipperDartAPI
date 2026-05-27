@@ -30,7 +30,8 @@ class _WindowsBlePlatform extends _UniversalBlePlatformBase {
 }
 
 class _WindowsBleTransport extends _UniversalBleTransportBase {
-  _WindowsBleTransport._(super.device);
+  _WindowsBleTransport._(BleDiscoveredDevice device)
+    : super(device, _UniversalBleOps());
 
   static Future<_WindowsBleTransport> create(BleDiscoveredDevice device) async {
     final transport = _WindowsBleTransport._(device);

@@ -43,7 +43,8 @@ class _IosBlePlatform extends _UniversalBlePlatformBase {
 }
 
 class _IosBleTransport extends _UniversalBleTransportBase {
-  _IosBleTransport._(super.device);
+  _IosBleTransport._(BleDiscoveredDevice device)
+    : super(device, _UniversalBleOps());
 
   static Future<_IosBleTransport> create(BleDiscoveredDevice device) async {
     final transport = _IosBleTransport._(device);

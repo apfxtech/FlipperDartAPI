@@ -1,5 +1,170 @@
 part of '../flipper_client.dart';
 
+// ── Native macOS BLE adapter (uses FlipperBlePlugin via MethodChannel) ───────
+
+class _NativeMacosOps implements _BleOps {
+  static const _mc = MethodChannel('com.qunleashed.flipper/ble');
+  static const _ec = EventChannel('com.qunleashed.flipper/ble/events');
+
+  // Single active instance — only one BLE transport runs at a time
+  static _NativeMacosOps? _instance;
+  static StreamSubscription<dynamic>? _evSub;
+
+  void Function(String, bool, String?)? _onConn;
+  void Function(String, String, Uint8List, int?)? _onValue;
+
+  _NativeMacosOps() {
+    _instance = this;
+    _evSub ??= _ec.receiveBroadcastStream().listen(_dispatch, onError: (_) {});
+  }
+
+  static void _dispatch(dynamic raw) {
+    final ops = _instance;
+    if (ops == null) return;
+    final event = raw as Map<Object?, Object?>;
+    final type = event['type'] as String;
+    switch (type) {
+      case 'connectionChange':
+        final error = event['error'];
+        ops._onConn?.call(
+          event['deviceId'] as String,
+          event['connected'] as bool,
+          error is String ? error : null,
+        );
+      case 'valueChange':
+        // FlutterStandardTypedData → Uint8List is decoded automatically by codec
+        final raw = event['value'];
+        final bytes = raw is Uint8List
+            ? raw
+            : raw is List
+            ? Uint8List.fromList(raw.cast<int>())
+            : Uint8List(0);
+        ops._onValue?.call(
+          event['deviceId'] as String,
+          event['charUuid'] as String,
+          bytes,
+          null,
+        );
+    }
+  }
+
+  @override
+  set onConnectionChange(void Function(String, bool, String?)? cb) =>
+      _onConn = cb;
+
+  @override
+  set onValueChange(
+    void Function(String, String, Uint8List, int?)? cb,
+  ) => _onValue = cb;
+
+  @override
+  Future<void> connect(String deviceId) =>
+      _mc.invokeMethod('connect', {'deviceId': deviceId});
+
+  @override
+  Future<int> requestMtu(String deviceId, int mtu) async {
+    final v = await _mc.invokeMethod<int>('requestMtu', {
+      'deviceId': deviceId,
+      'mtu': mtu,
+    });
+    return v ?? 23;
+  }
+
+  @override
+  Future<List<_BleService>> discoverServices(String deviceId) async {
+    final raw = await _mc.invokeMethod<List<dynamic>>(
+      'discoverServices',
+      {'deviceId': deviceId},
+    );
+    return (raw ?? []).map((svc) {
+      final s = svc as Map<Object?, Object?>;
+      final chars = (s['characteristics'] as List<dynamic>).map((ch) {
+        final c = ch as Map<Object?, Object?>;
+        return _BleChar(
+          c['uuid'] as String,
+          canWrite: c['canWrite'] as bool? ?? false,
+          canWriteNoRsp: c['canWriteNoRsp'] as bool? ?? false,
+          canNotify: c['canNotify'] as bool? ?? false,
+          canIndicate: c['canIndicate'] as bool? ?? false,
+        );
+      }).toList();
+      return _BleService(s['uuid'] as String, chars);
+    }).toList();
+  }
+
+  @override
+  Future<void> subscribeNotifications(
+    String deviceId,
+    String svcId,
+    String charId,
+  ) => _mc.invokeMethod('subscribe', {
+    'deviceId': deviceId,
+    'serviceUuid': svcId,
+    'charUuid': charId,
+    'indication': false,
+  });
+
+  @override
+  Future<void> subscribeIndications(
+    String deviceId,
+    String svcId,
+    String charId,
+  ) => _mc.invokeMethod('subscribe', {
+    'deviceId': deviceId,
+    'serviceUuid': svcId,
+    'charUuid': charId,
+    'indication': true,
+  });
+
+  @override
+  Future<Uint8List> read(String deviceId, String svcId, String charId) async {
+    final v = await _mc.invokeMethod<Uint8List>('read', {
+      'deviceId': deviceId,
+      'serviceUuid': svcId,
+      'charUuid': charId,
+    });
+    return v ?? Uint8List(0);
+  }
+
+  @override
+  Future<void> write(
+    String deviceId,
+    String svcId,
+    String charId,
+    Uint8List data, {
+    bool withoutResponse = false,
+  }) => _mc.invokeMethod('write', {
+    'deviceId': deviceId,
+    'serviceUuid': svcId,
+    'charUuid': charId,
+    'data': data,
+    'withoutResponse': withoutResponse,
+  });
+
+  @override
+  Future<void> disconnect(String deviceId) =>
+      _mc.invokeMethod('disconnect', {'deviceId': deviceId});
+
+  @override
+  Future<_BleConnState?> getConnectionState(String deviceId) async {
+    try {
+      final s = await _mc.invokeMethod<String>(
+        'getConnectionState',
+        {'deviceId': deviceId},
+      );
+      return switch (s) {
+        'connected' => _BleConnState.connected,
+        'connecting' => _BleConnState.connecting,
+        _ => _BleConnState.disconnected,
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+// ── macOS BLE platform ────────────────────────────────────────────────────────
+
 class _MacosBlePlatform extends _UniversalBlePlatformBase {
   _MacosBlePlatform();
 
@@ -38,9 +203,7 @@ class _MacosBlePlatform extends _UniversalBlePlatformBase {
   bool includeDevice(BleDiscoveredDevice device) {
     final services = device.device.services.map((uuid) => uuid.toLowerCase());
     if (_hasFlipperService(services)) return true;
-
     if (_hasFlipperService(device.device.serviceData.keys)) return true;
-
     final name = device.name.toLowerCase();
     return name.contains('flipper') || name.contains('flip_');
   }
@@ -57,16 +220,18 @@ class _MacosBlePlatform extends _UniversalBlePlatformBase {
   }
 }
 
-class _MacosBleTransport extends _UniversalBleTransportBase {
-  _MacosBleTransport._(super.device);
+// ── macOS BLE transport ───────────────────────────────────────────────────────
 
-  bool _wasAlreadyConnected = false;
+class _MacosBleTransport extends _UniversalBleTransportBase {
+  _MacosBleTransport._(BleDiscoveredDevice device)
+    : super(device, _NativeMacosOps());
 
   static Future<_MacosBleTransport> create(BleDiscoveredDevice device) async {
     final transport = _MacosBleTransport._(device);
     await transport._configure();
-    // CoreBluetooth negotiates MTU automatically; requestMtu() returns 23 on macOS.
-    // Use a safe default that works without explicit negotiation.
+    // macOS auto-negotiates MTU; if the native plugin returned a suspiciously
+    // small value (e.g. peripheral was connected before discovery), fall back
+    // to 182 which is the typical negotiated limit on modern hardware.
     if (transport._bleChunkSize < 100) {
       transport._bleChunkSize = 182;
       LogService.log('[BLE] macOS: MTU not negotiated, using chunk=182');
@@ -74,41 +239,14 @@ class _MacosBleTransport extends _UniversalBleTransportBase {
     return transport;
   }
 
-  // Fix 1: on macOS, calling connect() on an already-connected peripheral
-  // waits indefinitely for a DidConnect callback that never fires.
-  @override
-  Future<void> _connectDevice() async {
-    uble.BleConnectionState? state;
-    try {
-      state = await uble.UniversalBle.getConnectionState(_device.device.deviceId)
-          .timeout(const Duration(seconds: 2));
-    } catch (_) {
-      // If the check hangs or fails, fall through to connect() as normal.
-    }
-    if (state == uble.BleConnectionState.connected) {
-      LogService.log('[BLE] macOS: peripheral already connected, skipping connect()');
-      _wasAlreadyConnected = true;
-      return;
-    }
-    await uble.UniversalBle.connect(_device.device.deviceId);
-  }
-
-  // Skip the settle delay when the peripheral was already connected — the link
-  // is stable and CoreBluetooth does not need time to negotiate parameters.
-  @override
-  Future<void> _postConnectDelay() =>
-      _wasAlreadyConnected
-          ? Future.value()
-          : Future.delayed(const Duration(milliseconds: 600));
-
-  // Fix 2: subscribe to rpcStatus so firmware auto-starts RPC session.
+  // Fix: subscribe to rpcStatus so firmware auto-starts RPC session on macOS.
   @override
   Future<void> _openExtra() async {
     final svc = _rpcStatusSvcId;
     final chr = _rpcStatusCharId;
     if (svc == null || chr == null) return;
     try {
-      await uble.UniversalBle.subscribeNotifications(
+      await _ops.subscribeNotifications(
         _device.device.deviceId,
         svc,
         chr,
@@ -119,8 +257,7 @@ class _MacosBleTransport extends _UniversalBleTransportBase {
     }
   }
 
-  // Fix 3: writing to rpcStatus on macOS CoreBluetooth triggers an ATT error
-  // that tears the whole connection down.
+  // Writing to rpcStatus on macOS triggers an ATT error that drops the link.
   @override
   bool get _canWriteRpcStatus => false;
 }

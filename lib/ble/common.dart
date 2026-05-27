@@ -1,5 +1,168 @@
 part of '../flipper_client.dart';
 
+// ── BLE service / characteristic model ──────────────────────────────────────
+
+class _BleService {
+  final String uuid;
+  final List<_BleChar> characteristics;
+  _BleService(this.uuid, this.characteristics);
+}
+
+class _BleChar {
+  final String uuid;
+  final bool canWrite;
+  final bool canWriteNoRsp;
+  final bool canNotify;
+  final bool canIndicate;
+  _BleChar(
+    this.uuid, {
+    required this.canWrite,
+    required this.canWriteNoRsp,
+    required this.canNotify,
+    required this.canIndicate,
+  });
+}
+
+enum _BleConnState { connected, connecting, disconnected }
+
+// ── BLE operations adapter ───────────────────────────────────────────────────
+
+abstract class _BleOps {
+  // Connection / disconnection change callback (set by transport, cleared on close)
+  set onConnectionChange(
+    void Function(String deviceId, bool isConnected, String? error)? cb,
+  );
+
+  // Characteristic value change callback
+  set onValueChange(
+    void Function(String deviceId, String charId, Uint8List value, int? mtu)?
+    cb,
+  );
+
+  Future<void> connect(String deviceId);
+  Future<int> requestMtu(String deviceId, int mtu);
+  Future<List<_BleService>> discoverServices(String deviceId);
+  Future<void> subscribeNotifications(
+    String deviceId,
+    String svcId,
+    String charId,
+  );
+  Future<void> subscribeIndications(
+    String deviceId,
+    String svcId,
+    String charId,
+  );
+  Future<Uint8List> read(String deviceId, String svcId, String charId);
+  Future<void> write(
+    String deviceId,
+    String svcId,
+    String charId,
+    Uint8List data, {
+    bool withoutResponse = false,
+  });
+  Future<void> disconnect(String deviceId);
+  Future<_BleConnState?> getConnectionState(String deviceId);
+}
+
+// ── universal_ble adapter (all platforms except macOS) ──────────────────────
+
+class _UniversalBleOps implements _BleOps {
+  @override
+  set onConnectionChange(
+    void Function(String, bool, String?)? cb,
+  ) {
+    uble.UniversalBle.onConnectionChange =
+        cb == null ? null : (did, conn, err) => cb(did, conn, err?.toString());
+  }
+
+  @override
+  set onValueChange(void Function(String, String, Uint8List, int?)? cb) {
+    uble.UniversalBle.onValueChange = cb;
+  }
+
+  @override
+  Future<void> connect(String deviceId) =>
+      uble.UniversalBle.connect(deviceId);
+
+  @override
+  Future<int> requestMtu(String deviceId, int mtu) =>
+      uble.UniversalBle.requestMtu(deviceId, mtu);
+
+  @override
+  Future<List<_BleService>> discoverServices(String deviceId) async {
+    final svcs = await uble.UniversalBle.discoverServices(deviceId);
+    return svcs.map((s) {
+      final chars = s.characteristics.map((c) {
+        return _BleChar(
+          c.uuid,
+          canWrite: c.properties.contains(uble.CharacteristicProperty.write),
+          canWriteNoRsp: c.properties.contains(
+            uble.CharacteristicProperty.writeWithoutResponse,
+          ),
+          canNotify: c.properties.contains(uble.CharacteristicProperty.notify),
+          canIndicate: c.properties.contains(
+            uble.CharacteristicProperty.indicate,
+          ),
+        );
+      }).toList();
+      return _BleService(s.uuid, chars);
+    }).toList();
+  }
+
+  @override
+  Future<void> subscribeNotifications(
+    String deviceId,
+    String svcId,
+    String charId,
+  ) => uble.UniversalBle.subscribeNotifications(deviceId, svcId, charId);
+
+  @override
+  Future<void> subscribeIndications(
+    String deviceId,
+    String svcId,
+    String charId,
+  ) => uble.UniversalBle.subscribeIndications(deviceId, svcId, charId);
+
+  @override
+  Future<Uint8List> read(String deviceId, String svcId, String charId) =>
+      uble.UniversalBle.read(deviceId, svcId, charId);
+
+  @override
+  Future<void> write(
+    String deviceId,
+    String svcId,
+    String charId,
+    Uint8List data, {
+    bool withoutResponse = false,
+  }) => uble.UniversalBle.write(
+    deviceId,
+    svcId,
+    charId,
+    data,
+    withoutResponse: withoutResponse,
+  );
+
+  @override
+  Future<void> disconnect(String deviceId) =>
+      uble.UniversalBle.disconnect(deviceId);
+
+  @override
+  Future<_BleConnState?> getConnectionState(String deviceId) async {
+    try {
+      final s = await uble.UniversalBle.getConnectionState(deviceId);
+      return switch (s) {
+        uble.BleConnectionState.connected => _BleConnState.connected,
+        uble.BleConnectionState.connecting => _BleConnState.connecting,
+        _ => _BleConnState.disconnected,
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+// ── _BlePlatform interface ───────────────────────────────────────────────────
+
 abstract class _BlePlatform {
   Future<void> requestPermissions();
 
@@ -35,11 +198,16 @@ abstract class _UniversalBlePlatformBase implements _BlePlatform {
   }
 }
 
+// ── Base BLE transport ───────────────────────────────────────────────────────
+
 abstract class _UniversalBleTransportBase extends _Transport {
-  static const String overflowCharUuid = '19ed82ae-ed21-4c9d-4145-228e63fe0000';
+  static const String overflowCharUuid =
+      '19ed82ae-ed21-4c9d-4145-228e63fe0000';
   static const String rpcStatusCharUuid =
       '19ed82ae-ed21-4c9d-4145-228e64fe0000';
-final BleDiscoveredDevice _device;
+
+  final BleDiscoveredDevice _device;
+  final _BleOps _ops;
 
   late final String _txSvcId;
   late final String _txCharId;
@@ -70,17 +238,17 @@ final BleDiscoveredDevice _device;
 
   static _UniversalBleTransportBase? _activeTransport;
 
-  _UniversalBleTransportBase(this._device);
+  _UniversalBleTransportBase(this._device, this._ops);
 
-  // Override in subclasses to inject a delay between connect and service discovery.
+  // Override to inject a delay between connect and service discovery.
   Future<void> _postConnectDelay() async {}
 
-  // Override to skip connect() if the peripheral is already connected (macOS).
+  // Override to skip connect() if the peripheral is already connected.
   Future<void> _connectDevice() async {
-    await uble.UniversalBle.connect(_device.device.deviceId);
+    await _ops.connect(_device.device.deviceId);
   }
 
-  // Override to subscribe to extra characteristics after open (macOS rpcStatus).
+  // Override to subscribe to extra characteristics after open (e.g. macOS rpcStatus).
   Future<void> _openExtra() async {}
 
   // Override to false on platforms where writing rpcStatus tears the link (macOS).
@@ -91,19 +259,14 @@ final BleDiscoveredDevice _device;
     await _postConnectDelay();
     int negotiatedMtu = 23;
     try {
-      negotiatedMtu = await uble.UniversalBle.requestMtu(
-        _device.device.deviceId,
-        517,
-      );
+      negotiatedMtu = await _ops.requestMtu(_device.device.deviceId, 517);
     } catch (e) {
       LogService.log(
         '[BLE] requestMtu failed: $e (using default $negotiatedMtu)',
       );
     }
 
-    final services = await uble.UniversalBle.discoverServices(
-      _device.device.deviceId,
-    );
+    final services = await _ops.discoverServices(_device.device.deviceId);
     String? txSvc;
     String? txChar;
     String? rxSvc;
@@ -123,16 +286,12 @@ final BleDiscoveredDevice _device;
           if (cid == FlipperClient.bleTxUuid) {
             txSvc = service.uuid;
             txChar = char.uuid;
-            txWithResponse = char.properties.contains(
-              uble.CharacteristicProperty.write,
-            );
+            txWithResponse = char.canWrite;
           }
           if (cid == FlipperClient.bleRxUuid) {
             rxSvc = service.uuid;
             rxChar = char.uuid;
-            rxUsesIndicate = char.properties.contains(
-              uble.CharacteristicProperty.indicate,
-            );
+            rxUsesIndicate = char.canIndicate;
           }
           if (cid == overflowCharUuid) {
             overflowSvc = service.uuid;
@@ -188,7 +347,7 @@ final BleDiscoveredDevice _device;
   @override
   Future<void> open() async {
     _activeTransport = this;
-    uble.UniversalBle.onConnectionChange = (deviceId, isConnected, error) {
+    _ops.onConnectionChange = (deviceId, isConnected, error) {
       if (deviceId != _device.device.deviceId) return;
       if (!isConnected) {
         final wasDisconnecting =
@@ -200,32 +359,32 @@ final BleDiscoveredDevice _device;
       }
     };
 
-    uble.UniversalBle.onValueChange = (deviceId, charId, value, mtu) {
+    _ops.onValueChange = (deviceId, charId, value, mtu) {
       _onValueChange(deviceId, charId, value, mtu);
     };
 
     _connectionPhase = _BleConnectionPhase.connected;
 
     if (_rxUsesIndicate) {
-      await uble.UniversalBle.subscribeIndications(
+      await _ops.subscribeIndications(
         _device.device.deviceId,
         _rxSvcId,
         _rxCharId,
       );
     } else {
-      await uble.UniversalBle.subscribeNotifications(
+      await _ops.subscribeNotifications(
         _device.device.deviceId,
         _rxSvcId,
         _rxCharId,
       );
     }
 
-    await uble.UniversalBle.subscribeNotifications(
+    await _ops.subscribeNotifications(
       _device.device.deviceId,
       _overflowSvcId!,
       _overflowCharId!,
     );
-    final initial = await uble.UniversalBle.read(
+    final initial = await _ops.read(
       _device.device.deviceId,
       _overflowSvcId!,
       _overflowCharId!,
@@ -259,7 +418,6 @@ final BleDiscoveredDevice _device;
     if (bytes.length >= 4) {
       remaining = view.getUint32(0, Endian.big);
     } else if (bytes.length >= 2) {
-      // Older Flipper firmware sends 2-byte uint16_t overflow counter.
       remaining = view.getUint16(0, Endian.big);
     } else {
       return;
@@ -306,9 +464,6 @@ final BleDiscoveredDevice _device;
         } catch (e) {
           if (!pending.completer.isCompleted) pending.completer.completeError(e);
           if (_closed) break;
-          // Write failed while connected — BLE link is broken before
-          // onConnectionChange fires. Fault the transport immediately so the
-          // client reconnects instead of retrying into a dead connection.
           onTransportFault(e);
           break;
         }
@@ -330,7 +485,7 @@ final BleDiscoveredDevice _device;
       await _waitForBudgetFor(chunkLen);
       if (_closed) throw StateError('BLE transport closed');
       final genBefore = _budgetGen;
-      await uble.UniversalBle.write(
+      await _ops.write(
         _device.device.deviceId,
         _txSvcId,
         _txCharId,
@@ -350,10 +505,9 @@ final BleDiscoveredDevice _device;
         await completer.future.timeout(const Duration(seconds: 5));
       } on TimeoutException {
         _budgetSignal = null;
-        // Firmware may have missed a notification — re-read to unblock.
         if (!_closed && _overflowSvcId != null && _overflowCharId != null) {
           try {
-            final value = await uble.UniversalBle.read(
+            final value = await _ops.read(
               _device.device.deviceId,
               _overflowSvcId!,
               _overflowCharId!,
@@ -421,7 +575,7 @@ final BleDiscoveredDevice _device;
       return;
     }
     final state = await _readConnectionState();
-    if (state == uble.BleConnectionState.disconnected) {
+    if (state == _BleConnState.disconnected) {
       _markBleDisconnected();
       _clearBleCallbacks();
       return;
@@ -429,9 +583,9 @@ final BleDiscoveredDevice _device;
     _connectionPhase = _BleConnectionPhase.disconnecting;
     _disconnectSignal = Completer<void>();
     try {
-      await uble.UniversalBle.disconnect(_device.device.deviceId);
+      await _ops.disconnect(_device.device.deviceId);
       final stateAfterDisconnect = await _readConnectionState();
-      if (stateAfterDisconnect == uble.BleConnectionState.disconnected) {
+      if (stateAfterDisconnect == _BleConnState.disconnected) {
         _markBleDisconnected();
       }
       await _disconnectSignal!.future.timeout(
@@ -453,24 +607,12 @@ final BleDiscoveredDevice _device;
     if (serviceId == null || charId == null || _closed) return;
     if (!_canWriteRpcStatus) return;
 
-    await uble.UniversalBle.write(
-      _device.device.deviceId,
-      serviceId,
-      charId,
-      Uint8List(1),
-    );
+    await _ops.write(_device.device.deviceId, serviceId, charId, Uint8List(1));
     LogService.log('[BLE] RPC restart requested');
   }
 
-  Future<uble.BleConnectionState?> _readConnectionState() async {
-    try {
-      return await uble.UniversalBle.getConnectionState(
-        _device.device.deviceId,
-      );
-    } catch (e) {
-      LogService.log('[BLE] getConnectionState failed: $e');
-      return null;
-    }
+  Future<_BleConnState?> _readConnectionState() async {
+    return _ops.getConnectionState(_device.device.deviceId);
   }
 
   void _markBleDisconnected() {
@@ -483,8 +625,8 @@ final BleDiscoveredDevice _device;
   void _clearBleCallbacks() {
     if (_activeTransport == this) {
       _activeTransport = null;
-      uble.UniversalBle.onConnectionChange = null;
-      uble.UniversalBle.onValueChange = null;
+      _ops.onConnectionChange = null;
+      _ops.onValueChange = null;
     }
   }
 }

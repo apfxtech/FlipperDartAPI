@@ -4,6 +4,8 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
 
+import 'package:flutter/services.dart';
+
 import 'package:flutter_libserialport/flutter_libserialport.dart';
 import 'package:protobuf/protobuf.dart' as $pb;
 import 'package:universal_ble/universal_ble.dart' as uble;

@@ -30,7 +30,8 @@ class _AndroidBlePlatform extends _UniversalBlePlatformBase {
 }
 
 class _AndroidBleTransport extends _UniversalBleTransportBase {
-  _AndroidBleTransport._(super.device);
+  _AndroidBleTransport._(BleDiscoveredDevice device)
+    : super(device, _UniversalBleOps());
 
   static Future<_AndroidBleTransport> create(BleDiscoveredDevice device) async {
     final transport = _AndroidBleTransport._(device);

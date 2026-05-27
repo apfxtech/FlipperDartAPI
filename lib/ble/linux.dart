@@ -28,7 +28,8 @@ class _LinuxBlePlatform extends _UniversalBlePlatformBase {
 }
 
 class _LinuxBleTransport extends _UniversalBleTransportBase {
-  _LinuxBleTransport._(super.device);
+  _LinuxBleTransport._(BleDiscoveredDevice device)
+    : super(device, _UniversalBleOps());
 
   static Future<_LinuxBleTransport> create(BleDiscoveredDevice device) async {
     final transport = _LinuxBleTransport._(device);
