@@ -236,12 +236,6 @@ class _MacosBleTransport extends _UniversalBleTransportBase {
     return transport;
   }
 
-  @override
-  bool _txUsesWriteWithResponse(_BleChar char) {
-    if (char.canWriteNoRsp) return false;
-    return char.canWrite;
-  }
-
   // Fix: subscribe to rpcStatus so firmware auto-starts RPC session on macOS.
   @override
   Future<void> _openExtra() async {
@@ -256,6 +250,14 @@ class _MacosBleTransport extends _UniversalBleTransportBase {
     } catch (e) {
       LogService.log('[BLE] macOS: rpcStatus subscribe failed (non-fatal): $e');
     }
+    // After all subscriptions are registered, pause before sending any RPC data.
+    // This gives the Flipper firmware time to send an L2CAP Connection Parameter
+    // Update Request; macOS accepts it and negotiates a shorter connection interval
+    // (typically 15–30 ms vs the 100 ms macOS default).  btleplug uses the same
+    // 300 ms settle for exactly this reason.  The pause is harmless — it is well
+    // below the BLE supervision timeout and no GATT operations are in flight.
+    await Future.delayed(const Duration(milliseconds: 300));
+    LogService.log('[BLE] macOS: connection parameter settle complete');
   }
 
   // Writing to rpcStatus on macOS triggers an ATT error that drops the link.

@@ -43,6 +43,14 @@ public final class FlipperBlePlugin: NSObject, FlutterPlugin {
 
     // MARK: - State
 
+    // Dedicated serial queue for all CoreBluetooth work.
+    // Keeps BLE callbacks off the main thread so Flutter UI and WiFi coexistence
+    // scheduling on the shared Broadcom combo chip do not stall BLE events.
+    private let bleQueue = DispatchQueue(
+        label: "com.qunleashed.flipper.ble.cb",
+        qos: .userInteractive
+    )
+
     private var central: CBCentralManager!
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var pstate: [UUID: PeripheralState] = [:]
@@ -54,8 +62,7 @@ public final class FlipperBlePlugin: NSObject, FlutterPlugin {
 
     public override init() {
         super.init()
-        // Must be initialised on main queue; CoreBluetooth callbacks run on main queue.
-        central = CBCentralManager(delegate: self, queue: .main,
+        central = CBCentralManager(delegate: self, queue: bleQueue,
                                    options: [CBCentralManagerOptionShowPowerAlertKey: true])
     }
 
@@ -68,7 +75,11 @@ public final class FlipperBlePlugin: NSObject, FlutterPlugin {
         return s
     }
 
-    private func emit(_ event: Any) { eventSink?(event) }
+    // eventSink must be called on the main thread (Flutter requirement).
+    // bleQueue callbacks dispatch here so BLE processing and event delivery are decoupled.
+    private func emit(_ event: Any) {
+        DispatchQueue.main.async { [weak self] in self?.eventSink?(event) }
+    }
 
     private func centralStateStr() -> String {
         switch central.state {
@@ -175,7 +186,16 @@ public final class FlipperBlePlugin: NSObject, FlutterPlugin {
 
     // MARK: - Method channel handler
 
+    // Flutter calls handle() on the main thread.  We dispatch immediately to
+    // bleQueue so the actual logic runs alongside CoreBluetooth callbacks — no
+    // concurrent access to shared state.  Results are marshalled back to main
+    // because Flutter requires FlutterResult to be called on the main thread.
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        let r: FlutterResult = { v in DispatchQueue.main.async { result(v) } }
+        bleQueue.async { [weak self] in self?.handleOnQueue(call, result: r) }
+    }
+
+    private func handleOnQueue(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         let args = call.arguments as? [String: Any] ?? [:]
 
         switch call.method {

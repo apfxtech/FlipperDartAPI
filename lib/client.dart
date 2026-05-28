@@ -468,6 +468,10 @@ class FlipperClient {
 
   Future<FlipperDevice> connect(FlipperDevice device) async {
     await disconnect();
+    // Stop any active scan before connecting.  On macOS this eliminates the
+    // second CBCentralManager instance (universal_ble) from competing for
+    // connection events, which otherwise halves effective BLE throughput.
+    await stopScan();
 
     _Transport? transport;
     try {
