@@ -1149,15 +1149,22 @@ class FlipperClient {
     _rawCtrl.add(chunk);
 
     if (_mode == FlipperMode.rpc) {
-      final frames = _frameBuffer.push(chunk, onParseError: _onFrameParseError);
-      if (frames.isEmpty) {
+      final result = _frameBuffer.push(chunk, onParseError: _onFrameParseError);
+      if (result.frames.isEmpty) {
         LogService.log(
-          '[RPC] rx ${chunk.length} bytes, buffering (pending frame)',
+          '[RPC] rx ${chunk.length} bytes, buffering (pending frame) '
+          '${result.pendingState ?? '<no state>'}',
         );
         return;
       }
-      for (final frame in frames) {
+      for (final frame in result.frames) {
         _routeFrame(frame);
+      }
+      if (result.pendingState != null) {
+        LogService.log(
+          '[RPC] parsed ${result.frames.length} frame(s), residual '
+          '${result.pendingState}',
+        );
       }
       return;
     }
@@ -1633,6 +1640,39 @@ class _Protocol {
   }
 }
 
+class _FrameBufferPushResult {
+  _FrameBufferPushResult(this.frames, this.pendingState);
+  final List<Main> frames;
+  final _FrameBufferPendingState? pendingState;
+}
+
+class _FrameBufferPendingState {
+  _FrameBufferPendingState({
+    required this.bytesInBuffer,
+    required this.varintComplete,
+    required this.declaredLength,
+    required this.bytesAvailableForPayload,
+    required this.bytesNeeded,
+    required this.headerHex,
+  });
+  final int bytesInBuffer;
+  final bool varintComplete;
+  final int? declaredLength;
+  final int? bytesAvailableForPayload;
+  final int? bytesNeeded;
+  final String headerHex;
+
+  @override
+  String toString() {
+    if (!varintComplete) {
+      return 'partial varint, bytesInBuffer=$bytesInBuffer head=$headerHex';
+    }
+    return 'waiting payload: declared=$declaredLength '
+        'have=$bytesAvailableForPayload need=$bytesNeeded '
+        'bytesInBuffer=$bytesInBuffer head=$headerHex';
+  }
+}
+
 class _FrameBuffer {
   static const _initialCapacity = 512;
   Uint8List _buf = Uint8List(_initialCapacity);
@@ -1641,7 +1681,6 @@ class _FrameBuffer {
 
   void _makeRoom(int needed) {
     if (_writePos + needed <= _buf.length) return;
-    // Compact: slide unconsumed data to the front.
     if (_readPos > 0) {
       final unread = _writePos - _readPos;
       _buf.setRange(0, unread, _buf, _readPos);
@@ -1649,7 +1688,6 @@ class _FrameBuffer {
       _readPos = 0;
       if (_writePos + needed <= _buf.length) return;
     }
-    // Grow.
     var cap = _buf.length;
     while (cap < _writePos + needed) {
       cap *= 2;
@@ -1659,7 +1697,7 @@ class _FrameBuffer {
     _buf = next;
   }
 
-  List<Main> push(
+  _FrameBufferPushResult push(
     List<int> chunk, {
     void Function(Object error)? onParseError,
   }) {
@@ -1679,7 +1717,57 @@ class _FrameBuffer {
       _writePos = unread;
       _readPos = 0;
     }
-    return messages;
+
+    _FrameBufferPendingState? pending;
+    if (_readPos < _writePos) {
+      pending = _describePending();
+    }
+    return _FrameBufferPushResult(messages, pending);
+  }
+
+  _FrameBufferPendingState _describePending() {
+    final available = _writePos - _readPos;
+    final previewLen = available < 16 ? available : 16;
+    final preview = _buf.sublist(_readPos, _readPos + previewLen);
+    final hex = preview
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join(' ');
+
+    var length = 0;
+    var shift = 0;
+    var offset = _readPos;
+    var varintComplete = false;
+    while (offset < _writePos) {
+      final byte = _buf[offset++];
+      length |= (byte & 0x7F) << shift;
+      shift += 7;
+      if ((byte & 0x80) == 0) {
+        varintComplete = true;
+        break;
+      }
+      if (shift >= 35) break;
+    }
+
+    if (!varintComplete) {
+      return _FrameBufferPendingState(
+        bytesInBuffer: available,
+        varintComplete: false,
+        declaredLength: null,
+        bytesAvailableForPayload: null,
+        bytesNeeded: null,
+        headerHex: hex,
+      );
+    }
+    final payloadAvail = _writePos - offset;
+    final need = length - payloadAvail;
+    return _FrameBufferPendingState(
+      bytesInBuffer: available,
+      varintComplete: true,
+      declaredLength: length,
+      bytesAvailableForPayload: payloadAvail,
+      bytesNeeded: need > 0 ? need : 0,
+      headerHex: hex,
+    );
   }
 
   void clear() {
@@ -1702,7 +1790,8 @@ class _FrameBuffer {
       if ((byte & 0x80) == 0) {
         if (length > 65536) {
           LogService.log(
-            '[FrameBuffer] bad varint length=$length (0x${_buf[_readPos].toRadixString(16)}), dropping first byte',
+            '[FrameBuffer] bad varint length=$length '
+            '(0x${_buf[_readPos].toRadixString(16)}), dropping first byte',
           );
           _readPos += 1;
           onParseError?.call(
@@ -1728,7 +1817,8 @@ class _FrameBuffer {
 
       if (shift >= 35) {
         LogService.log(
-          '[FrameBuffer] varint overflow, dropping first byte (0x${_buf[_readPos].toRadixString(16)})',
+          '[FrameBuffer] varint overflow, dropping first byte '
+          '(0x${_buf[_readPos].toRadixString(16)})',
         );
         _readPos += 1;
         onParseError?.call(const FormatException('Protobuf varint overflow'));

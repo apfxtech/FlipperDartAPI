@@ -351,9 +351,16 @@ abstract class _UniversalBleTransportBase extends _Transport {
       if (!isConnected) {
         final wasDisconnecting =
             _connectionPhase == _BleConnectionPhase.disconnecting;
-        final reason = error == null || error.trim().isEmpty
-            ? 'backend connectionChange disconnected without error'
-            : 'backend connectionChange disconnected: $error';
+        final platformError = error?.trim();
+        final reason = platformError == null || platformError.isEmpty
+            ? 'backend connectionChange disconnected without platform reason '
+                  '(likely supervision timeout / peer reset / out of range)'
+            : 'backend connectionChange disconnected: $platformError';
+        LogService.log(
+          '[BLE] onConnectionChange isConnected=false '
+          'phase=$_connectionPhase budget=$_budget txQueue=${_txQueue.length} '
+          'platformError=${platformError ?? '<null>'}',
+        );
         _markBleDisconnected(reason);
         if (!wasDisconnecting) {
           onTransportFault(FlipperTransportError('BLE $reason'));
