@@ -190,9 +190,18 @@ final BleDiscoveredDevice _device;
       if (!isConnected) {
         final wasDisconnecting =
             _connectionPhase == _BleConnectionPhase.disconnecting;
+        LogService.log(
+          '[BLE] onConnectionChange isConnected=false '
+          'phase=$_connectionPhase budget=$_budget txQueue=${_txQueue.length} '
+          'platformError=${error ?? '<null>'}',
+        );
         _markBleDisconnected();
         if (!wasDisconnecting) {
-          onTransportFault(StateError('BLE disconnected'));
+          final reason = error == null || error.toString().isEmpty
+              ? 'BLE disconnected (no platform reason reported — likely '
+                    'supervision timeout / peer reset / out of range)'
+              : 'BLE disconnected: $error';
+          onTransportFault(StateError(reason));
         }
       }
     };
