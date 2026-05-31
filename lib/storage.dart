@@ -29,6 +29,42 @@ extension FlipperStorageApi on FlipperClient {
     );
   }
 
+  /// Reads [path], reporting incremental progress as response frames arrive.
+  /// When [expectedSize] is > 0 (e.g. the size from a prior directory listing),
+  /// [onProgress] is called with a 0..1 ratio of bytes received; it always
+  /// fires once with 1.0 on completion. Returns the assembled file bytes.
+  Future<List<int>> storageReadChunked(
+    String path, {
+    int expectedSize = 0,
+    void Function(double progress)? onProgress,
+    Duration timeout = const Duration(minutes: 5),
+    FlipperRequestPriority priority = FlipperRequestPriority.foreground,
+  }) async {
+    var received = 0;
+    final batch = await callRpc(
+      Main(storageReadRequest: ReadRequest(path: path)),
+      (frame) =>
+          frame.hasStorageReadResponse() ? frame.storageReadResponse : null,
+      timeout: timeout,
+      priority: priority,
+      onFrame: (frame) {
+        if (!frame.hasStorageReadResponse()) return;
+        final resp = frame.storageReadResponse;
+        if (!resp.hasFile()) return;
+        received += resp.file.data.length;
+        if (expectedSize > 0) {
+          onProgress?.call((received / expectedSize).clamp(0.0, 1.0));
+        }
+      },
+    );
+    final bytes = <int>[];
+    for (final r in batch.items) {
+      if (r.hasFile()) bytes.addAll(r.file.data);
+    }
+    onProgress?.call(1.0);
+    return bytes;
+  }
+
   Future<List<Main>> storageWrite(
     WriteRequest request, {
     Duration timeout = const Duration(seconds: 8),

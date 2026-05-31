@@ -742,6 +742,7 @@ class FlipperClient {
     Main request, {
     Duration timeout = const Duration(seconds: 8),
     FlipperRequestPriority priority = FlipperRequestPriority.defaultPriority,
+    void Function(Main frame)? onFrame,
   }) async {
     if (_mode != FlipperMode.rpc) {
       await switchToRpcMode();
@@ -751,7 +752,7 @@ class FlipperClient {
         : request.commandId;
     request.commandId = commandId;
 
-    final pending = _PendingRpc(commandId);
+    final pending = _PendingRpc(commandId)..onFrame = onFrame;
     _pendingRpc[commandId] = pending;
     void armTimeout() {
       pending.armTimeout(timeout, () {
@@ -908,11 +909,13 @@ class FlipperClient {
     T? Function(Main frame) pick, {
     Duration timeout = const Duration(seconds: 8),
     FlipperRequestPriority priority = FlipperRequestPriority.defaultPriority,
+    void Function(Main frame)? onFrame,
   }) async {
     final frames = await callRpcFrames(
       request,
       timeout: timeout,
       priority: priority,
+      onFrame: onFrame,
     );
     final items = <T>[];
     for (final frame in frames) {
@@ -1437,10 +1440,15 @@ class _PendingRpc {
 
   _PendingRpc(this.commandId);
 
+  /// Invoked for each frame as it arrives, before completion. Lets callers
+  /// observe incremental progress of multi-frame responses (e.g. reads).
+  void Function(Main frame)? onFrame;
+
   Future<List<Main>> get future => _completer.future;
 
   void add(Main frame) {
     frames.add(frame);
+    onFrame?.call(frame);
   }
 
   Duration? _watchdogTimeout;
