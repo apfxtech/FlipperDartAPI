@@ -242,7 +242,7 @@ extension FlipperStorageApi on FlipperClient {
     String path,
     List<int> data, {
     void Function(double progress)? onProgress,
-    Duration timeout = const Duration(seconds: 60),
+    Duration timeout = const Duration(seconds: 300),
     FlipperRequestPriority priority = FlipperRequestPriority.foreground,
   }) async {
     final total = data.length;

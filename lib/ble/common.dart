@@ -254,7 +254,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
   // Override to false on platforms where writing rpcStatus tears the link (macOS).
   bool get _canWriteRpcStatus => true;
 
-  bool _txUsesWriteWithResponse(_BleChar char) => char.canWrite;
+  bool _txUsesWriteWithResponse(_BleChar char) => !char.canWriteNoRsp;
 
   Future<void> _configure() async {
     await _connectDevice();
@@ -426,18 +426,26 @@ abstract class _UniversalBleTransportBase extends _Transport {
 
   void _applyOverflowValue(List<int> value) {
     final bytes = value is Uint8List ? value : Uint8List.fromList(value);
-    final view = ByteData.view(bytes.buffer);
+    final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+    final view = ByteData.view(
+      bytes.buffer,
+      bytes.offsetInBytes,
+      bytes.lengthInBytes,
+    );
     int remaining;
     if (bytes.length >= 4) {
       remaining = view.getUint32(0, Endian.big);
     } else if (bytes.length >= 2) {
       remaining = view.getUint16(0, Endian.big);
     } else {
+      LogService.log('[BLE] overflow: payload too short hex=[$hex]');
       return;
     }
     _budget = remaining;
     _budgetGen += 1;
-    LogService.log('[BLE] overflow remaining=$remaining (gen $_budgetGen)');
+    LogService.log(
+      '[BLE] overflow remaining=$remaining hex=[$hex] (gen $_budgetGen)',
+    );
     final signal = _budgetSignal;
     _budgetSignal = null;
     if (signal != null && !signal.isCompleted) signal.complete();
@@ -448,13 +456,24 @@ abstract class _UniversalBleTransportBase extends _Transport {
     if (_closed) throw StateError('BLE transport closed');
     if (bytes.isEmpty) return;
 
-    final completer = Completer<void>();
-    _txQueue.add(_BlePendingSend(bytes, completer));
-    final sig = _txDataSignal;
-    _txDataSignal = null;
-    if (sig != null && !sig.isCompleted) sig.complete();
-    _startSender();
-    await completer.future;
+    if (!_txWithResponse) {
+      // WWNR: enqueue immediately, overflow-driven sender handles pacing.
+      // Progress is tracked by caller (local frame count), not by BLE write completion.
+      _txQueue.add(_BlePendingSend(bytes, null));
+      final sig = _txDataSignal;
+      _txDataSignal = null;
+      if (sig != null && !sig.isCompleted) sig.complete();
+      _startSender();
+    } else {
+      // WR: enqueue and block until the BLE write is acknowledged.
+      final completer = Completer<void>();
+      _txQueue.add(_BlePendingSend(bytes, completer));
+      final sig = _txDataSignal;
+      _txDataSignal = null;
+      if (sig != null && !sig.isCompleted) sig.complete();
+      _startSender();
+      await completer.future;
+    }
   }
 
   void _startSender() {
@@ -470,17 +489,51 @@ abstract class _UniversalBleTransportBase extends _Transport {
           await _waitForData();
           continue;
         }
-        final pending = _txQueue.removeAt(0);
-        try {
-          await _sendMessage(pending.bytes);
-          if (!pending.completer.isCompleted) pending.completer.complete();
-        } catch (e) {
-          if (!pending.completer.isCompleted) {
-            pending.completer.completeError(e);
+
+        if (_txWithResponse) {
+          // WR: simple sequential send, one frame at a time.
+          final pending = _txQueue.removeAt(0);
+          try {
+            await _sendMessage(pending.bytes);
+            final c = pending.completer;
+            if (c != null && !c.isCompleted) c.complete();
+          } catch (e) {
+            final c = pending.completer;
+            if (c != null && !c.isCompleted) c.completeError(e);
+            if (_closed) break;
+            onTransportFault(e);
+            break;
           }
+        } else {
+          // WWNR: overflow-driven. Wait for firmware to signal available buffer,
+          // then drain up to that many bytes. Sending more than budget per cycle
+          // causes firmware to clamp bytes_ready_to_receive to 0, triggering the
+          // next overflow notification.
+          await _waitForOverflowBudget();
           if (_closed) break;
-          onTransportFault(e);
-          break;
+
+          var cycleRemaining = _budget;
+          _budget = 0;
+
+          while (!_closed && cycleRemaining > 0) {
+            if (_txQueue.isEmpty) {
+              try {
+                await _waitForData().timeout(const Duration(milliseconds: 100));
+              } on TimeoutException {
+                break;
+              }
+              if (_txQueue.isEmpty) break;
+            }
+            final pending = _txQueue.removeAt(0);
+            try {
+              await _sendMessage(pending.bytes);
+              cycleRemaining -= pending.bytes.length;
+            } catch (e) {
+              if (_closed) break;
+              onTransportFault(e);
+              return;
+            }
+          }
         }
       }
     } catch (e, st) {
@@ -496,10 +549,6 @@ abstract class _UniversalBleTransportBase extends _Transport {
     while (offset < data.length) {
       if (_closed) throw StateError('BLE transport closed');
       final chunkEnd = (offset + _bleMtuSize).clamp(0, data.length);
-      final chunkLen = chunkEnd - offset;
-      await _waitForBudgetFor(chunkLen);
-      if (_closed) throw StateError('BLE transport closed');
-      final genBefore = _budgetGen;
       await _ops.write(
         _device.device.deviceId,
         _txSvcId,
@@ -507,13 +556,12 @@ abstract class _UniversalBleTransportBase extends _Transport {
         Uint8List.sublistView(data, offset, chunkEnd),
         withoutResponse: !_txWithResponse,
       );
-      if (_budgetGen == genBefore) _budget -= chunkLen;
       offset = chunkEnd;
     }
   }
 
-  Future<void> _waitForBudgetFor(int needed) async {
-    while (!_closed && _budget < needed) {
+  Future<void> _waitForOverflowBudget() async {
+    while (!_closed && _budget <= 0) {
       final completer = Completer<void>();
       _budgetSignal = completer;
       try {
@@ -548,7 +596,8 @@ abstract class _UniversalBleTransportBase extends _Transport {
     final pendings = List<_BlePendingSend>.from(_txQueue);
     _txQueue.clear();
     for (final p in pendings) {
-      if (!p.completer.isCompleted) p.completer.completeError(error);
+      final c = p.completer;
+      if (c != null && !c.isCompleted) c.completeError(error);
     }
   }
 
@@ -665,5 +714,5 @@ enum _BleConnectionPhase { disconnected, connected, disconnecting }
 class _BlePendingSend {
   _BlePendingSend(this.bytes, this.completer);
   final Uint8List bytes;
-  final Completer<void> completer;
+  final Completer<void>? completer;
 }
