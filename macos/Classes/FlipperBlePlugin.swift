@@ -14,8 +14,9 @@ private final class PeripheralState {
     var pendingReads: [CBUUID: FlutterResult] = [:]
     // Pending subscribe confirmations
     var pendingSubscribes: [CBUUID: FlutterResult] = [:]
-    // Write-without-response queue: (char, data, completionResult)
-    var noRspQueue: [(CBCharacteristic, Data, FlutterResult)] = []
+    // Write-without-response queue. Only the final ATT packet owns the result
+    // for the original split-write call.
+    var noRspQueue: [(CBCharacteristic, Data, FlutterResult?)] = []
     // Write-with-response queues per characteristic (only one in-flight at a time)
     var rspQueue: [CBUUID: [(Data, FlutterResult)]] = [:]
 }
@@ -27,6 +28,10 @@ public final class FlipperBlePlugin: NSObject, FlutterPlugin {
 
     static let kMethodChannel = "com.qunleashed.flipper/ble"
     static let kEventChannel  = "com.qunleashed.flipper/ble/events"
+    // Flipper negotiates ATT_MTU=414, so a Write Command can carry at most
+    // ATT_MTU - 3 = 411 bytes. The 486-byte characteristic value limit is not
+    // a valid single-packet write size.
+    private static let flipperAttWritePayloadMax = 411
 
     // UUID of the Flipper Zero primary BLE service — used for system-device lookup
     private static let flipperSvcUUID = CBUUID(string: "8fe5b3d5-2e7f-4a98-2a48-7acc60fe0000")
@@ -180,7 +185,7 @@ public final class FlipperBlePlugin: NSObject, FlutterPlugin {
         while !s.noRspQueue.isEmpty && p.canSendWriteWithoutResponse {
             let (ch, data, res) = s.noRspQueue.removeFirst()
             p.writeValue(data, for: ch, type: .withoutResponse)
-            res(nil)
+            res?(nil)
         }
     }
 
@@ -311,9 +316,27 @@ public final class FlipperBlePlugin: NSObject, FlutterPlugin {
                     result(FlutterError(code: "WRITE_UNSUPPORTED", message: "Char \(chr) does not support writeWithoutResponse", details: nil))
                     return
                 }
-                // Queue and drain; peripheralIsReady resumes if buffer was full
-                s.noRspQueue.append((ch, raw.data, result))
-                drainNoRspQueue(p)
+                let maxLength = min(
+                    p.maximumWriteValueLength(for: .withoutResponse),
+                    Self.flipperAttWritePayloadMax
+                )
+                guard maxLength > 0 else {
+                    result(FlutterError(code: "WRITE_FAILED", message: "Invalid maximum write length", details: nil))
+                    return
+                }
+                var offset = 0
+                while offset < raw.data.count {
+                    let end = min(offset + maxLength, raw.data.count)
+                    let packet = raw.data.subdata(in: offset..<end)
+                    let isFinal = end == raw.data.count
+                    s.noRspQueue.append((ch, packet, isFinal ? result : nil))
+                    offset = end
+                }
+                if raw.data.isEmpty {
+                    result(nil)
+                } else {
+                    drainNoRspQueue(p)
+                }
             } else {
                 guard ch.properties.contains(.write) else {
                     result(FlutterError(code: "WRITE_UNSUPPORTED", message: "Char \(chr) does not support write", details: nil))

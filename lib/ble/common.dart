@@ -204,7 +204,8 @@ abstract class _UniversalBleTransportBase extends _Transport {
       '19ed82ae-ed21-4c9d-4145-228e64fe0000';
   static const int _bleChunkSize = 512;
   static const int _minBleMtuSize = 20;
-  static const int _maxBleMtuSize = 160;
+  // Flipper supports ATT_MTU=414, leaving 411 bytes for a Write Command.
+  static const int _maxBleMtuSize = 411;
 
   final BleDiscoveredDevice _device;
   final _BleOps _ops;
@@ -521,9 +522,11 @@ abstract class _UniversalBleTransportBase extends _Transport {
             // Signal pickup before the BLE write so the producer (rawWrite caller)
             // can enqueue the next frame while this one is being sent to the radio.
             if (!pending.completer.isCompleted) pending.completer.complete();
-            final sendLength = pending.remainingLength < cycleRemaining
-                ? pending.remainingLength
-                : cycleRemaining;
+            final sendLength = [
+              pending.remainingLength,
+              cycleRemaining,
+              _bleMtuSize,
+            ].reduce((a, b) => a < b ? a : b);
             final sendEnd = pending.offset + sendLength;
             try {
               await _sendMessage(
@@ -534,6 +537,10 @@ abstract class _UniversalBleTransportBase extends _Transport {
               if (pending.offset == pending.bytes.length) {
                 _txQueue.removeAt(0);
               }
+              if (_budgetGen != cycleBudgetGen) {
+                cycleRemaining = 0;
+                break;
+              }
             } catch (e) {
               if (_closed) break;
               onTransportFault(e);
@@ -541,9 +548,8 @@ abstract class _UniversalBleTransportBase extends _Transport {
             }
           }
 
-          // The overflow value is a reusable byte budget, not permission for a
-          // single burst. Keep unused capacity for later RPC frames, as the
-          // Android throttler does while waiting for its next channel item.
+          // Keep unused capacity for later RPC frames, as the Android
+          // throttler does while waiting for its next channel item.
           // A newer notification is authoritative and must not be overwritten.
           if (cycleRemaining > 0 && _budgetGen == cycleBudgetGen) {
             _budget = cycleRemaining;
@@ -581,20 +587,10 @@ abstract class _UniversalBleTransportBase extends _Transport {
       try {
         await completer.future.timeout(const Duration(seconds: 5));
       } on TimeoutException {
-        _budgetSignal = null;
-        if (!_closed && _overflowSvcId != null && _overflowCharId != null) {
-          try {
-            final value = await _ops.read(
-              _device.device.deviceId,
-              _overflowSvcId!,
-              _overflowCharId!,
-            );
-            _applyOverflowValue(value);
-            LogService.log('[BLE] overflow re-read after budget timeout');
-          } catch (e) {
-            LogService.log('[BLE] overflow re-read failed: $e');
-          }
-        }
+        if (identical(_budgetSignal, completer)) _budgetSignal = null;
+        // A read returns the characteristic's last stored value, not a fresh
+        // firmware credit. Reusing it can overrun the 1024-byte RPC buffer.
+        LogService.log('[BLE] waiting for fresh overflow notification');
       }
     }
   }
