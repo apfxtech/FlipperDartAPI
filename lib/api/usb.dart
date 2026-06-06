@@ -1,4 +1,4 @@
-part of 'flipper_client.dart';
+part of '../flipper_client.dart';
 
 final _UsbPlatform _usbPlatform = _createUsbPlatform();
 

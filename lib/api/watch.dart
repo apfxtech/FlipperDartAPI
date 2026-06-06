@@ -1,4 +1,4 @@
-part of 'flipper_client.dart';
+part of '../flipper_client.dart';
 
 extension FlipperWatchApi on FlipperClient {
   /// Battery stream with staggered update intervals.

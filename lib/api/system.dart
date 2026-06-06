@@ -1,4 +1,4 @@
-part of 'flipper_client.dart';
+part of '../flipper_client.dart';
 
 extension FlipperSystemApi on FlipperClient {
   Future<FlipperRpcBatch<PingResponse>> ping(

@@ -1,4 +1,4 @@
-part of 'flipper_client.dart';
+part of '../flipper_client.dart';
 
 extension FlipperDesktopApi on FlipperClient {
   Stream<Status> desktopStatusStream() {

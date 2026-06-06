@@ -6,7 +6,7 @@ import 'package:flutter_libserialport/flutter_libserialport.dart';
 import 'package:universal_ble/universal_ble.dart' as uble;
 import 'package:usb_serial/usb_serial.dart';
 
-import 'log_service.dart';
+import '../log_service.dart';
 
 enum DeviceTransport { ble, usb }
 
@@ -91,8 +91,9 @@ class AndroidUsbDiscoveredDevice extends UsbDiscoveredDevice {
   Future<ConnectedDevice> connect() async {
     LogService.log('[USB] opening port for $name...');
     final port = await usbDevice.create();
-    if (port == null)
+    if (port == null) {
       throw Exception('USB permission denied or port unavailable');
+    }
     final opened = await port.open();
     if (!opened) throw Exception('Failed to open USB port');
     await port.setPortParameters(
@@ -255,8 +256,9 @@ class BleConnectedDevice implements ConnectedDevice {
       }
     }
 
-    if (txSvc == null || rxSvc == null)
+    if (txSvc == null || rxSvc == null) {
       throw Exception('No suitable BLE characteristics');
+    }
 
     _txSvcId = txSvc;
     _txCharId = txChar!;

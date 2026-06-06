@@ -1,0 +1,57 @@
+part of '../flipper_client.dart';
+
+class FlipperDevice {
+  final String id;
+  final String name;
+  final FlipperLink link;
+  final DiscoveredDevice source;
+  final int? vendorId;
+  final int? productId;
+  final String? serialNumber;
+  final int? rssi;
+
+  const FlipperDevice({
+    required this.id,
+    required this.name,
+    required this.link,
+    required this.source,
+    this.vendorId,
+    this.productId,
+    this.serialNumber,
+    this.rssi,
+  });
+
+  bool get isUsb => link == FlipperLink.usb;
+
+  bool get isBle => link == FlipperLink.ble;
+}
+
+class FlipperRpcBatch<T extends $pb.GeneratedMessage> {
+  final int commandId;
+  final Main request;
+  final List<Main> frames;
+  final List<T> items;
+
+  const FlipperRpcBatch({
+    required this.commandId,
+    required this.request,
+    required this.frames,
+    required this.items,
+  });
+
+  T get single => items.single;
+
+  T? get firstOrNull => items.isEmpty ? null : items.first;
+}
+
+class FlipperConnectionState {
+  final FlipperMode mode;
+  final FlipperDevice? device;
+  final bool connected;
+
+  const FlipperConnectionState({
+    required this.mode,
+    required this.device,
+    required this.connected,
+  });
+}

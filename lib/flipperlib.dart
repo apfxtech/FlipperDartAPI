@@ -1,6 +1,6 @@
 export 'protobuf.dart';
 export 'flipper_client.dart';
-export 'discovered_device.dart';
+export 'device/discovered.dart';
 export 'log_service.dart';
 
 import 'flipper_client.dart';
