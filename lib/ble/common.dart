@@ -578,7 +578,6 @@ abstract class _UniversalBleTransportBase extends _Transport {
         }
       }
     }
-    if (_closed) throw StateError('BLE transport closed');
   }
 
   Future<void> _waitForData() async {
