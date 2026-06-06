@@ -237,14 +237,17 @@ class FlipperClient {
       _setMode(transport.initialMode);
       _startWorker();
       return device;
-    } catch (_) {
+    } catch (error) {
+      LogService.log(
+        '[FlipperClient] connect failed '
+        'device=${device.name} link=${device.link.name}: $error',
+      );
       await _cleanupFailedConnect(transport);
       rethrow;
     }
   }
 
   Future<void> _cleanupFailedConnect(_Transport? transport) async {
-    LogService.log('[FlipperClient] state -> disconnected: connect failed');
     _transport = null;
     _connectedDevice = null;
     _deviceInfoCache.clear();
@@ -267,10 +270,6 @@ class FlipperClient {
 
   Future<void> disconnect() async {
     final transport = _transport;
-    LogService.log(
-      '[FlipperClient] state -> disconnected: disconnect requested'
-      '${transport == null ? ' (no active transport)' : ''}',
-    );
     _transport = null;
     _switchToRpcFuture = null;
     _deviceInfoCache.clear();
@@ -1003,17 +1002,11 @@ class FlipperClient {
   void _onTransportError(Object error, StackTrace stackTrace) {
     LogService.log('[FlipperClient] transport error: $error');
     if (_transport == null) return;
-    LogService.log(
-      '[FlipperClient] state -> disconnected: transport stream error',
-    );
     unawaited(disconnect());
   }
 
   void _onTransportDone() {
     if (_transport == null) return;
-    LogService.log(
-      '[FlipperClient] state -> disconnected: transport stream closed',
-    );
     unawaited(disconnect());
   }
 

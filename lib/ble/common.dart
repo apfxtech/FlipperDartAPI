@@ -360,14 +360,14 @@ abstract class _UniversalBleTransportBase extends _Transport {
             ? 'backend connectionChange disconnected without platform reason '
                   '(likely supervision timeout / peer reset / out of range)'
             : 'backend connectionChange disconnected: $platformError';
-        LogService.log(
-          '[BLE] onConnectionChange isConnected=false '
-          'phase=$_connectionPhase budget=$_budget txQueue=${_txQueue.length} '
-          'platformError=${platformError ?? '<null>'}',
-        );
-        _markBleDisconnected(reason);
+        final diagnostics =
+            'phase=$_connectionPhase budget=$_budget '
+            'txQueue=${_txQueue.length}';
+        _markBleDisconnected();
         if (!wasDisconnecting) {
-          onTransportFault(FlipperTransportError('BLE $reason'));
+          onTransportFault(
+            FlipperTransportError('BLE $reason ($diagnostics)'),
+          );
         }
       }
     };
@@ -505,6 +505,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
           if (_closed) break;
 
           var cycleRemaining = _budget;
+          final cycleBudgetGen = _budgetGen;
           _budget = 0;
 
           while (!_closed && cycleRemaining > 0) {
@@ -516,18 +517,36 @@ abstract class _UniversalBleTransportBase extends _Transport {
               }
               if (_txQueue.isEmpty) break;
             }
-            final pending = _txQueue.removeAt(0);
+            final pending = _txQueue.first;
             // Signal pickup before the BLE write so the producer (rawWrite caller)
             // can enqueue the next frame while this one is being sent to the radio.
             if (!pending.completer.isCompleted) pending.completer.complete();
+            final sendLength = pending.remainingLength < cycleRemaining
+                ? pending.remainingLength
+                : cycleRemaining;
+            final sendEnd = pending.offset + sendLength;
             try {
-              await _sendMessage(pending.bytes);
-              cycleRemaining -= pending.bytes.length;
+              await _sendMessage(
+                Uint8List.sublistView(pending.bytes, pending.offset, sendEnd),
+              );
+              pending.offset = sendEnd;
+              cycleRemaining -= sendLength;
+              if (pending.offset == pending.bytes.length) {
+                _txQueue.removeAt(0);
+              }
             } catch (e) {
               if (_closed) break;
               onTransportFault(e);
               return;
             }
+          }
+
+          // The overflow value is a reusable byte budget, not permission for a
+          // single burst. Keep unused capacity for later RPC frames, as the
+          // Android throttler does while waiting for its next channel item.
+          // A newer notification is authoritative and must not be overwritten.
+          if (cycleRemaining > 0 && _budgetGen == cycleBudgetGen) {
+            _budget = cycleRemaining;
           }
         }
       }
@@ -605,7 +624,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
     _txDataSignal = null;
     if (dataSignal != null && !dataSignal.isCompleted) dataSignal.complete();
     _failAllPending(error);
-    _markBleDisconnected('transport fault: $error');
+    _markBleDisconnected();
     _clearBleCallbacks();
   }
 
@@ -639,9 +658,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
     _disconnectSignal = Completer<void>();
     final state = await _readConnectionState();
     if (state == _BleConnState.disconnected) {
-      _markBleDisconnected(
-        'close requested; backend state already disconnected',
-      );
+      _markBleDisconnected();
       _clearBleCallbacks();
       return;
     }
@@ -650,7 +667,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
       await _ops.disconnect(_device.device.deviceId);
       final stateAfterDisconnect = await _readConnectionState();
       if (stateAfterDisconnect == _BleConnState.disconnected) {
-        _markBleDisconnected('close requested; backend confirmed disconnected');
+        _markBleDisconnected();
       }
       await _disconnectSignal!.future.timeout(
         const Duration(seconds: 5),
@@ -661,7 +678,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
     } catch (e) {
       LogService.log('[BLE] disconnect failed: $e');
     } finally {
-      _markBleDisconnected('close cleanup finished');
+      _markBleDisconnected();
       _clearBleCallbacks();
     }
   }
@@ -681,12 +698,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
     return _ops.getConnectionState(_device.device.deviceId);
   }
 
-  void _markBleDisconnected(String reason) {
-    if (_connectionPhase != _BleConnectionPhase.disconnected) {
-      LogService.log('[BLE] state -> disconnected: $reason');
-    } else {
-      LogService.log('[BLE] remains disconnected: $reason');
-    }
+  void _markBleDisconnected() {
     _connectionPhase = _BleConnectionPhase.disconnected;
     final signal = _disconnectSignal;
     _disconnectSignal = null;
@@ -708,4 +720,7 @@ class _BlePendingSend {
   _BlePendingSend(this.bytes, this.completer);
   final Uint8List bytes;
   final Completer<void> completer;
+  int offset = 0;
+
+  int get remainingLength => bytes.length - offset;
 }
