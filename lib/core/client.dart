@@ -15,10 +15,12 @@ class FlipperClient {
   final _messageCtrl = StreamController<Main>.broadcast();
   final _broadcastCtrl = StreamController<Main>.broadcast();
   final _errorCtrl = StreamController<FlipperRpcException>.broadcast();
-  final _deviceNameCtrl = StreamController<String>.broadcast();
   final _deviceInfoCompleteCtrl =
       StreamController<Map<String, String>>.broadcast();
   bool _deviceInfoFetched = false;
+
+  final _deviceInfoWatchCtrl = StreamController<Map<String, String>>.broadcast();
+  int _collectionGen = 0;
 
   final Map<String, FlipperDevice> _devices = {};
   final Map<int, _PendingRpc> _pendingRpc = {};
@@ -68,18 +70,27 @@ class FlipperClient {
 
   Map<String, String> get deviceInfoCache => Map.unmodifiable(_deviceInfoCache);
 
-  Stream<String> get deviceNameStream => _deviceNameCtrl.stream;
-
   Stream<Map<String, String>> get deviceInfoStream =>
       _deviceInfoCompleteCtrl.stream;
 
   String? getName() =>
       _deviceInfoCache['hardware_name'] ?? _deviceInfoCache['device_name'];
 
-  Future<String> awaitName() {
+  Future<String> awaitName() async {
     final cached = getName();
-    if (cached != null) return Future.value(cached);
-    return deviceNameStream.first;
+    if (cached != null && cached.isNotEmpty) return cached;
+
+    await deviceInfoUpdates.firstWhere(
+      (patch) =>
+          (patch['hardware_name']?.isNotEmpty ?? false) ||
+          (patch['device_name']?.isNotEmpty ?? false),
+    );
+
+    final name = getName();
+    if (name == null || name.isEmpty) {
+      throw StateError('Device info does not contain a device name');
+    }
+    return name;
   }
 
   Future<Map<String, String>> awaitDeviceInfo() {
@@ -930,11 +941,8 @@ class FlipperClient {
       final value = info.value.trim();
       if (key.isNotEmpty && value.isNotEmpty) {
         _deviceInfoCache[key] = value;
-        if (key == 'hardware_name' || key == 'device_name') {
-          final name = getName();
-          if (name != null && !_deviceNameCtrl.isClosed) {
-            _deviceNameCtrl.add(name);
-          }
+        if (!_deviceInfoWatchCtrl.isClosed) {
+          _deviceInfoWatchCtrl.add({key: value});
         }
       }
     }
@@ -1101,8 +1109,8 @@ class FlipperClient {
     await _messageCtrl.close();
     await _broadcastCtrl.close();
     await _errorCtrl.close();
-    await _deviceNameCtrl.close();
     await _deviceInfoCompleteCtrl.close();
+    await _deviceInfoWatchCtrl.close();
   }
 
   void _setMode(FlipperMode mode) {
@@ -1125,8 +1133,12 @@ class FlipperClient {
     try {
       await deviceInfo(priority: FlipperRequestPriority.foreground);
       _deviceInfoFetched = true;
+      final snapshot = deviceInfoCache;
+      if (!_deviceInfoWatchCtrl.isClosed) {
+        _deviceInfoWatchCtrl.add(snapshot);
+      }
       if (!_deviceInfoCompleteCtrl.isClosed) {
-        _deviceInfoCompleteCtrl.add(deviceInfoCache);
+        _deviceInfoCompleteCtrl.add(snapshot);
       }
     } catch (_) {}
   }

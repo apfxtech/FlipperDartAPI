@@ -1,75 +1,104 @@
 part of '../flipper_client.dart';
 
 extension FlipperWatchApi on FlipperClient {
-  /// Battery stream with staggered update intervals.
+  /// Broadcast stream of device-info patches.
   ///
-  /// Emits partial [Map<String, String>] with `power.*` keys:
-  /// - First emission (immediate): all power fields.
-  /// - Every [currentInterval] (default 5 s): only `*current*` keys.
-  /// - Every 3rd tick (~15 s): all power fields again.
+  /// Each event is a partial [Map<String, String>] — subscribers merge it into
+  /// their own state. Subscribing has no side-effects; call
+  /// [startDeviceInfoCollection] to begin polling.
+  Stream<Map<String, String>> get deviceInfoUpdates =>
+      _deviceInfoWatchCtrl.stream;
+
+  /// Start (or restart) the background collection cycle.
   ///
-  /// Stream ends when the client disconnects.
-  Stream<Map<String, String>> watchBattery({
-    Duration currentInterval = const Duration(seconds: 5),
-  }) async* {
-    if (!isConnected) return;
-
-    // Initial full fetch — emit all fields immediately.
-    try {
-      final batch = await powerInfo(priority: FlipperRequestPriority.background);
-      yield {for (final item in batch.items) 'power.${item.key}': item.value};
-    } catch (e) {
-      LogService.log('[watchBattery] initial fetch: $e');
-      if (!isConnected) return;
-    }
-
-    var tick = 0;
-    while (isConnected) {
-      await Future<void>.delayed(currentInterval);
-      if (!isConnected) break;
-      tick++;
-
-      try {
-        final batch = await powerInfo(priority: FlipperRequestPriority.background);
-        final all = {for (final item in batch.items) 'power.${item.key}': item.value};
-
-        if (tick % 3 == 0) {
-          // Full refresh every ~15 s.
-          yield all;
-        } else {
-          // Emit only current-related keys every 5 s.
-          final partial = Map.fromEntries(
-            all.entries.where((e) => e.key.contains('current')),
-          );
-          if (partial.isNotEmpty) yield partial;
-        }
-      } catch (e) {
-        LogService.log('[watchBattery] poll: $e');
-        if (!isConnected) break;
-      }
-    }
+  /// Safe to call multiple times — each call cancels the previous cycle via
+  /// the generation counter. Call from an external controller, not the library.
+  void startDeviceInfoCollection() {
+    final gen = ++_collectionGen;
+    unawaited(_runCollection(gen));
   }
 
-  /// Storage stream with staggered update intervals.
-  ///
-  /// Emits partial [Map<String, String>] with `storage.*` keys:
-  /// - First emission (after [stagger]): `/ext` fields only (fast).
-  /// - Second emission: combined `/ext` + `/int` (after storageDu completes).
-  /// - Every [extInterval] (default 15 s): re-fetched `/ext` + cached `/int`.
-  ///
-  /// `/int` is fetched once and cached; it does not change at runtime.
-  /// Stream ends when the client disconnects.
-  Stream<Map<String, String>> watchStorage({
-    Duration stagger = const Duration(seconds: 3),
-    Duration extInterval = const Duration(seconds: 15),
-  }) async* {
+  /// Stop the running collection cycle.
+  void stopDeviceInfoCollection() {
+    _collectionGen++;
+  }
+
+  Future<void> _runCollection(int gen) async {
     if (!isConnected) return;
 
-    // Small stagger so the battery request enters the queue first.
-    await Future<void>.delayed(stagger);
-    if (!isConnected) return;
+    void emit(Map<String, String> data) {
+      if (gen != _collectionGen || _deviceInfoWatchCtrl.isClosed) return;
+      _deviceInfoWatchCtrl.add(data);
+    }
 
-    // Fetch /ext first — it is fast and unblocks the loading state.
+    bool alive() => gen == _collectionGen && isConnected;
+
+    // ── Phase 1: initial burst ────────────────────────────────────────────
+
+    final infoWasFetched = _deviceInfoFetched;
+
+    // Device info is requested automatically on entering RPC mode. Individual
+    // fields are emitted as they arrive; wait for the complete snapshot before
+    // queueing lower-priority requests.
+    try {
+      await awaitDeviceInfo().timeout(const Duration(seconds: 20));
+    } catch (e) {
+      LogService.log('[watchInfo] device info: $e');
+    }
+    if (!alive()) return;
+
+    // A completed request publishes its snapshot from _autoFetchDeviceInfo.
+    // Re-emit only when collection starts after that broadcast was missed.
+    if (infoWasFetched) {
+      final cached = Map<String, String>.from(deviceInfoCache);
+      if (cached.isNotEmpty) emit(cached);
+    }
+    if (!alive()) return;
+
+    // Battery (full)
+    try {
+      final batch = await powerInfo(priority: FlipperRequestPriority.background);
+      emit({for (final item in batch.items) 'power.${item.key}': item.value});
+    } catch (e) {
+      LogService.log('[watchInfo] battery initial: $e');
+    }
+    if (!alive()) return;
+
+    // Protobuf version
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    if (!alive()) return;
+    try {
+      final v = await protobufVersion(timeout: const Duration(seconds: 15));
+      final major = v.single.major;
+      final minor = v.single.minor;
+      emit({
+        'protobuf_version': '$major.$minor',
+        'protobuf_version_major': '$major',
+        'protobuf_version_minor': '$minor',
+      });
+    } catch (e) {
+      LogService.log('[watchInfo] protobuf: $e');
+    }
+    if (!alive()) return;
+
+    // DateTime
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    if (!alive()) return;
+    try {
+      final response = await getDateTime(timeout: const Duration(seconds: 15));
+      final dt = response.single.datetime;
+      emit({
+        'datetime': '${dt.year}-${_pad(dt.month)}-${_pad(dt.day)} '
+            '${_pad(dt.hour)}:${_pad(dt.minute)}:${_pad(dt.second)}',
+      });
+    } catch (e) {
+      LogService.log('[watchInfo] datetime: $e');
+    }
+    if (!alive()) return;
+
+    // Storage /ext — staggered so battery enters RPC queue first
+    await Future<void>.delayed(const Duration(seconds: 2));
+    if (!alive()) return;
     var extData = <String, String>{};
     try {
       final response = await storageInfo(
@@ -77,46 +106,77 @@ extension FlipperWatchApi on FlipperClient {
         priority: FlipperRequestPriority.background,
       );
       extData = _storageResponseToMap(response.single, 'storage.sdcard');
+      if (extData.isNotEmpty) emit(extData);
     } catch (e) {
-      LogService.log('[watchStorage] /ext initial: $e');
-      if (!isConnected) return;
+      LogService.log('[watchInfo] storage /ext initial: $e');
     }
+    if (!alive()) return;
 
-    if (extData.isNotEmpty) yield extData;
-
-    // Fetch /int once in the same generator step — may take up to 30 s.
-    var intData = <String, String>{};
-    if (isConnected) {
+    // Storage /int — slow (storageDu), fire-and-forget so periodic loop starts
+    unawaited(() async {
+      if (!alive()) return;
       try {
         final bytes = await storageDu(
           '/int',
           priority: FlipperRequestPriority.background,
         );
-        intData = {
-          'storage.internal.used_bytes': '$bytes',
-          'storage.internal.used': _watchFormatBytes(bytes),
-        };
-        yield {...extData, ...intData};
+        if (alive()) {
+          emit({
+            'storage.internal.used_bytes': '$bytes',
+            'storage.internal.used': _watchFormatBytes(bytes),
+          });
+        }
       } catch (e) {
-        LogService.log('[watchStorage] /int du: $e');
+        LogService.log('[watchInfo] storage /int: $e');
       }
-    }
+    }());
 
-    // Periodic /ext refresh; /int stays cached.
-    while (isConnected) {
-      await Future<void>.delayed(extInterval);
-      if (!isConnected) break;
+    // ── Phase 2: periodic loop ────────────────────────────────────────────
 
+    var tick = 0;
+    const interval = Duration(seconds: 5);
+
+    while (alive()) {
+      await Future<void>.delayed(interval);
+      if (!alive()) break;
+      tick++;
+
+      // Battery: partial every 5 s, full every 15 s
       try {
-        final response = await storageInfo(
-          InfoRequest(path: '/ext/'),
+        final batch = await powerInfo(
           priority: FlipperRequestPriority.background,
         );
-        extData = _storageResponseToMap(response.single, 'storage.sdcard');
-        yield {...extData, ...intData};
+        final all = {
+          for (final item in batch.items) 'power.${item.key}': item.value,
+        };
+        if (tick % 3 == 0) {
+          emit(all);
+        } else {
+          final partial = Map.fromEntries(
+            all.entries.where((e) => e.key.contains('current')),
+          );
+          if (partial.isNotEmpty) emit(partial);
+        }
       } catch (e) {
-        LogService.log('[watchStorage] /ext poll: $e');
-        if (!isConnected) break;
+        LogService.log('[watchInfo] battery poll: $e');
+        if (!alive()) break;
+      }
+
+      // Storage /ext every 15 s, staggered 500 ms after battery
+      if (alive() && tick % 3 == 0) {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        if (!alive()) break;
+        try {
+          final response = await storageInfo(
+            InfoRequest(path: '/ext/'),
+            priority: FlipperRequestPriority.background,
+          );
+          extData = _storageResponseToMap(response.single, 'storage.sdcard');
+          if (extData.isNotEmpty) emit(extData);
+        } catch (e) {
+          LogService.log('[watchInfo] storage /ext poll: $e');
+          if (!alive()) break;
+        }
       }
     }
   }
@@ -159,3 +219,5 @@ String _watchFormatPercent(int value, int total) {
   if (total <= 0) return '0%';
   return '${(value * 100 / total).toStringAsFixed(1)}%';
 }
+
+String _pad(int n) => n.toString().padLeft(2, '0');
