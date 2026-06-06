@@ -226,12 +226,14 @@ class _MacosBleTransport extends _UniversalBleTransportBase {
   static Future<_MacosBleTransport> create(BleDiscoveredDevice device) async {
     final transport = _MacosBleTransport._(device);
     await transport._configure();
-    // macOS auto-negotiates MTU; if the native plugin returned a suspiciously
-    // small value (e.g. peripheral was connected before discovery), fall back
-    // to 182 which is the typical negotiated limit on modern hardware.
-    if (transport._bleChunkSize < 100) {
-      transport._bleChunkSize = 182;
-      LogService.log('[BLE] macOS: MTU not negotiated, using chunk=182');
+    // macOS auto-negotiates MTU. If the plugin reports the default payload,
+    // use the firmware-safe ATT ceiling while keeping the RPC chunk at 512.
+    if (transport._bleMtuSize < 100) {
+      transport._bleMtuSize = _UniversalBleTransportBase._maxBleMtuSize;
+      LogService.log(
+        '[BLE] macOS: MTU not negotiated, using mtu='
+        '${transport._bleMtuSize}',
+      );
     }
     return transport;
   }

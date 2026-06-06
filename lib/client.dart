@@ -1534,7 +1534,7 @@ abstract class _Transport {
 
   FlipperMode get initialMode;
 
-  int get storageChunkSize => 512;
+  int get storageChunkSize => _UniversalBleTransportBase._bleChunkSize;
 
   Future<void> open();
 

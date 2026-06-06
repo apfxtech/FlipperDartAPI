@@ -246,10 +246,15 @@ extension FlipperStorageApi on FlipperClient {
     FlipperRequestPriority priority = FlipperRequestPriority.foreground,
   }) async {
     final total = data.length;
-    final chunkSize = _transport?.storageChunkSize ?? 512;
-    final totalFrames = total == 0 ? 1 : ((total + chunkSize - 1) ~/ chunkSize);
+    final rpcChunkSize =
+        _transport?.storageChunkSize ??
+        _UniversalBleTransportBase._bleChunkSize;
+    final totalFrames = total == 0
+        ? 1
+        : ((total + rpcChunkSize - 1) ~/ rpcChunkSize);
     LogService.log(
-      '[Storage] write "$path": ${total}B, $totalFrames frames, chunk=$chunkSize',
+      '[Storage] write "$path": ${total}B, $totalFrames frames, '
+      'rpcChunk=$rpcChunkSize',
     );
 
     try {
@@ -258,9 +263,9 @@ extension FlipperStorageApi on FlipperClient {
           var offset = 0;
           var frameIndex = 0;
           while (true) {
-            final end = (offset + chunkSize) > total
+            final end = (offset + rpcChunkSize) > total
                 ? total
-                : (offset + chunkSize);
+                : (offset + rpcChunkSize);
             final chunk = offset == end
                 ? const <int>[]
                 : data.sublist(offset, end);

@@ -46,9 +46,10 @@ class BleDiscoveredDevice implements DiscoveredDevice {
   Future<ConnectedDevice> connect() async {
     LogService.log('[BLE] connecting to $name...');
     await uble.UniversalBle.connect(device.deviceId);
+    var negotiatedMtu = 23;
     try {
-      final mtu = await uble.UniversalBle.requestMtu(device.deviceId, 256);
-      LogService.log('[BLE] mtu negotiated: $mtu');
+      negotiatedMtu = await uble.UniversalBle.requestMtu(device.deviceId, 517);
+      LogService.log('[BLE] mtu negotiated: $negotiatedMtu');
     } catch (e) {
       LogService.log('[BLE] mtu request failed (non-fatal): $e');
     }
@@ -60,7 +61,12 @@ class BleDiscoveredDevice implements DiscoveredDevice {
         LogService.log('[BLE]    chr ${c.uuid} props=${c.properties}');
       }
     }
-    return BleConnectedDevice(device.deviceId, name, services);
+    return BleConnectedDevice(
+      device.deviceId,
+      name,
+      services,
+      negotiatedMtu: negotiatedMtu,
+    );
   }
 }
 
@@ -85,11 +91,15 @@ class AndroidUsbDiscoveredDevice extends UsbDiscoveredDevice {
   Future<ConnectedDevice> connect() async {
     LogService.log('[USB] opening port for $name...');
     final port = await usbDevice.create();
-    if (port == null) throw Exception('USB permission denied or port unavailable');
+    if (port == null)
+      throw Exception('USB permission denied or port unavailable');
     final opened = await port.open();
     if (!opened) throw Exception('Failed to open USB port');
     await port.setPortParameters(
-      230400, UsbPort.DATABITS_8, UsbPort.STOPBITS_1, UsbPort.PARITY_NONE,
+      230400,
+      UsbPort.DATABITS_8,
+      UsbPort.STOPBITS_1,
+      UsbPort.PARITY_NONE,
     );
     LogService.log('[USB] port opened');
     return AndroidUsbConnectedDevice(usbDevice, port);
@@ -105,7 +115,9 @@ class DesktopUsbDiscoveredDevice extends UsbDiscoveredDevice {
   final int? productId;
   final String? serialNumber;
 
-  DesktopUsbDiscoveredDevice(this.portName, this.description, {
+  DesktopUsbDiscoveredDevice(
+    this.portName,
+    this.description, {
     this.vendorId,
     this.productId,
     this.serialNumber,
@@ -124,7 +136,8 @@ class DesktopUsbDiscoveredDevice extends UsbDiscoveredDevice {
     if (!port.openReadWrite()) {
       port.dispose();
       throw Exception(
-          'Failed to open $portName: ${SerialPort.lastError?.message}');
+        'Failed to open $portName: ${SerialPort.lastError?.message}',
+      );
     }
     final config = SerialPortConfig()
       ..baudRate = 230400
@@ -156,12 +169,16 @@ abstract class ConnectedDevice {
 
 class BleConnectedDevice implements ConnectedDevice {
   static const _svcUuid = '8fe5b3d5-2e7f-4a98-2a48-7acc60fe0000';
-  static const _rxUuid  = '19ed82ae-ed21-4c9d-4145-228e61fe0000';
-  static const _txUuid  = '19ed82ae-ed21-4c9d-4145-228e62fe0000';
+  static const _rxUuid = '19ed82ae-ed21-4c9d-4145-228e61fe0000';
+  static const _txUuid = '19ed82ae-ed21-4c9d-4145-228e62fe0000';
+  static const _bleChunkSize = 512;
+  static const _minBleMtuSize = 20;
+  static const _maxBleMtuSize = 160;
 
   final String deviceId;
   final String _name;
   final List<uble.BleService> _services;
+  final int _bleMtuSize;
 
   late final String _txSvcId, _txCharId, _rxSvcId, _rxCharId;
   late final bool _txWithResponse, _rxUsesIndicate;
@@ -171,7 +188,12 @@ class BleConnectedDevice implements ConnectedDevice {
 
   final _ctrl = StreamController<List<int>>.broadcast();
 
-  BleConnectedDevice(this.deviceId, this._name, this._services) {
+  BleConnectedDevice(
+    this.deviceId,
+    this._name,
+    this._services, {
+    required int negotiatedMtu,
+  }) : _bleMtuSize = (negotiatedMtu - 3).clamp(_minBleMtuSize, _maxBleMtuSize) {
     _setup();
   }
 
@@ -188,12 +210,16 @@ class BleConnectedDevice implements ConnectedDevice {
           if (cid == _txUuid) {
             txSvc = sid;
             txChar = cid;
-            txWithResponse = ch.properties.contains(uble.CharacteristicProperty.write);
+            txWithResponse = ch.properties.contains(
+              uble.CharacteristicProperty.write,
+            );
           }
           if (cid == _rxUuid) {
             rxSvc = sid;
             rxChar = cid;
-            rxIndicate = ch.properties.contains(uble.CharacteristicProperty.indicate);
+            rxIndicate = ch.properties.contains(
+              uble.CharacteristicProperty.indicate,
+            );
           }
         }
       }
@@ -205,10 +231,14 @@ class BleConnectedDevice implements ConnectedDevice {
         for (final ch in svc.characteristics) {
           if (txSvc == null &&
               (ch.properties.contains(uble.CharacteristicProperty.write) ||
-               ch.properties.contains(uble.CharacteristicProperty.writeWithoutResponse))) {
+                  ch.properties.contains(
+                    uble.CharacteristicProperty.writeWithoutResponse,
+                  ))) {
             txSvc = svc.uuid;
             txChar = ch.uuid;
-            txWithResponse = ch.properties.contains(uble.CharacteristicProperty.write);
+            txWithResponse = ch.properties.contains(
+              uble.CharacteristicProperty.write,
+            );
           }
           if (rxSvc == null &&
               ch.properties.contains(uble.CharacteristicProperty.indicate)) {
@@ -225,7 +255,8 @@ class BleConnectedDevice implements ConnectedDevice {
       }
     }
 
-    if (txSvc == null || rxSvc == null) throw Exception('No suitable BLE characteristics');
+    if (txSvc == null || rxSvc == null)
+      throw Exception('No suitable BLE characteristics');
 
     _txSvcId = txSvc;
     _txCharId = txChar!;
@@ -233,10 +264,13 @@ class BleConnectedDevice implements ConnectedDevice {
     _rxCharId = rxChar!;
     _txWithResponse = txWithResponse;
     _rxUsesIndicate = rxIndicate;
-    LogService.log('[BLE] TX=$_txSvcId/$_txCharId RX=$_rxSvcId/$_rxCharId indicate=$_rxUsesIndicate writeRsp=$_txWithResponse');
+    LogService.log(
+      '[BLE] TX=$_txSvcId/$_txCharId RX=$_rxSvcId/$_rxCharId indicate=$_rxUsesIndicate writeRsp=$_txWithResponse',
+    );
 
     uble.UniversalBle.onValueChange = (devId, charId, value, mtu) {
-      if (devId != deviceId || charId.toLowerCase() != _rxCharId.toLowerCase()) {
+      if (devId != deviceId ||
+          charId.toLowerCase() != _rxCharId.toLowerCase()) {
         return;
       }
       final now = DateTime.now();
@@ -256,11 +290,15 @@ class BleConnectedDevice implements ConnectedDevice {
     if (_rxUsesIndicate) {
       uble.UniversalBle.subscribeIndications(deviceId, _rxSvcId, _rxCharId)
           .then((_) => LogService.log('[BLE] subscribed (indicate)'))
-          .catchError((e) => LogService.log('[BLE] subscribeIndications error: $e'));
+          .catchError(
+            (e) => LogService.log('[BLE] subscribeIndications error: $e'),
+          );
     } else {
       uble.UniversalBle.subscribeNotifications(deviceId, _rxSvcId, _rxCharId)
           .then((_) => LogService.log('[BLE] subscribed (notify)'))
-          .catchError((e) => LogService.log('[BLE] subscribeNotifications error: $e'));
+          .catchError(
+            (e) => LogService.log('[BLE] subscribeNotifications error: $e'),
+          );
     }
   }
 
@@ -278,18 +316,21 @@ class BleConnectedDevice implements ConnectedDevice {
 
   @override
   Future<void> sendBytes(Uint8List bytes) async {
-    const chunk = 512;
-    for (int i = 0; i < bytes.length; i += chunk) {
-      final end = (i + chunk).clamp(0, bytes.length);
-      await uble.UniversalBle.write(
-        deviceId,
-        _txSvcId,
-        _txCharId,
-        bytes.sublist(i, end),
-        withoutResponse: !_txWithResponse,
-      );
-      LogService.log('[BLE TX] ${end - i} bytes');
-      await Future.delayed(const Duration(milliseconds: 10));
+    for (var rpcOffset = 0; rpcOffset < bytes.length;) {
+      final rpcEnd = (rpcOffset + _bleChunkSize).clamp(0, bytes.length);
+      for (var attOffset = rpcOffset; attOffset < rpcEnd;) {
+        final attEnd = (attOffset + _bleMtuSize).clamp(0, rpcEnd);
+        await uble.UniversalBle.write(
+          deviceId,
+          _txSvcId,
+          _txCharId,
+          bytes.sublist(attOffset, attEnd),
+          withoutResponse: !_txWithResponse,
+        );
+        LogService.log('[BLE TX] ${attEnd - attOffset} bytes');
+        attOffset = attEnd;
+      }
+      rpcOffset = rpcEnd;
     }
   }
 
@@ -336,10 +377,15 @@ class AndroidUsbConnectedDevice implements ConnectedDevice {
           return;
         }
         if (_looksLikeCliNoise(data)) {
-          LogService.log('[USB] drop CLI noise ${data.length} bytes: ${_escapeAscii(data)}');
+          LogService.log(
+            '[USB] drop CLI noise ${data.length} bytes: ${_escapeAscii(data)}',
+          );
           return;
         }
-        final hex = data.take(32).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+        final hex = data
+            .take(32)
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join(' ');
         LogService.log('[USB RX] ${data.length} bytes: $hex');
         _ctrl.add(data);
       },
@@ -382,7 +428,10 @@ class AndroidUsbConnectedDevice implements ConnectedDevice {
 
   @override
   Future<void> sendBytes(Uint8List bytes) async {
-    final hex = bytes.take(32).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+    final hex = bytes
+        .take(32)
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join(' ');
     LogService.log('[USB TX] ${bytes.length} bytes: $hex');
     await port.write(bytes);
   }
@@ -408,9 +457,9 @@ class AndroidUsbConnectedDevice implements ConnectedDevice {
   }
 
   String _escapeAscii(List<int> data) {
-    return String.fromCharCodes(data)
-        .replaceAll('\r', '\\r')
-        .replaceAll('\n', '\\n');
+    return String.fromCharCodes(
+      data,
+    ).replaceAll('\r', '\\r').replaceAll('\n', '\\n');
   }
 
   Future<void> _enterCli(List<int> initBuffer) async {
@@ -424,7 +473,9 @@ class AndroidUsbConnectedDevice implements ConnectedDevice {
     Timer? timeout;
     timeout = Timer(const Duration(seconds: 3), () {
       if (!cliReady.isCompleted) {
-        cliReady.completeError(Exception('Timeout waiting for Flipper CLI prompt'));
+        cliReady.completeError(
+          Exception('Timeout waiting for Flipper CLI prompt'),
+        );
       }
     });
 
@@ -457,7 +508,9 @@ class AndroidUsbConnectedDevice implements ConnectedDevice {
     Timer? timeout;
     timeout = Timer(const Duration(seconds: 3), () {
       if (!rpcReady.isCompleted) {
-        rpcReady.completeError(Exception('Timeout waiting for start_rpc_session echo'));
+        rpcReady.completeError(
+          Exception('Timeout waiting for start_rpc_session echo'),
+        );
       }
     });
 
@@ -525,14 +578,19 @@ class DesktopUsbConnectedDevice implements ConnectedDevice {
     if (!_rpcReady) {
       // Buffer instead of discard — init() will replay this
       _preInitBuffer.addAll(data);
-      LogService.log('[USB PRE-INIT] ${data.length} bytes: ${_escapeAscii(data)}');
+      LogService.log(
+        '[USB PRE-INIT] ${data.length} bytes: ${_escapeAscii(data)}',
+      );
       return;
     }
     if (_looksLikeCliNoise(data)) {
       LogService.log('[USB] drop CLI noise ${data.length} bytes');
       return;
     }
-    final hex = data.take(32).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+    final hex = data
+        .take(32)
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join(' ');
     LogService.log('[USB RX] ${data.length} bytes: $hex');
     _ctrl.add(data);
   }
@@ -576,7 +634,10 @@ class DesktopUsbConnectedDevice implements ConnectedDevice {
 
   @override
   Future<void> sendBytes(Uint8List bytes) async {
-    final hex = bytes.take(32).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+    final hex = bytes
+        .take(32)
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join(' ');
     LogService.log('[USB TX] ${bytes.length} bytes: $hex');
     _port.write(bytes);
   }
@@ -607,9 +668,9 @@ class DesktopUsbConnectedDevice implements ConnectedDevice {
         text.contains('start_rpc_session');
   }
 
-  String _escapeAscii(List<int> data) => String.fromCharCodes(data)
-      .replaceAll('\r', '\\r')
-      .replaceAll('\n', '\\n');
+  String _escapeAscii(List<int> data) => String.fromCharCodes(
+    data,
+  ).replaceAll('\r', '\\r').replaceAll('\n', '\\n');
 
   Future<void> _enterCli(List<int> initBuffer) async {
     LogService.log('[USB] entering CLI session...');
@@ -633,18 +694,26 @@ class DesktopUsbConnectedDevice implements ConnectedDevice {
 
     timeout = Timer(const Duration(seconds: 8), () {
       if (!cliReady.isCompleted) {
-        cliReady.completeError(Exception('Timeout waiting for Flipper CLI prompt'));
+        cliReady.completeError(
+          Exception('Timeout waiting for Flipper CLI prompt'),
+        );
       }
     });
 
     // Send CR every 300 ms in case DTR alone wasn't enough
     crTimer = Timer.periodic(const Duration(milliseconds: 300), (t) {
-      if (cliReady.isCompleted) { t.cancel(); return; }
+      if (cliReady.isCompleted) {
+        t.cancel();
+        return;
+      }
       _port.write(Uint8List.fromList([0x0D]));
     });
 
     Timer.periodic(const Duration(milliseconds: 25), (timer) {
-      if (cliReady.isCompleted) { timer.cancel(); return; }
+      if (cliReady.isCompleted) {
+        timer.cancel();
+        return;
+      }
       if (_asciiBuffer(initBuffer).contains(_cliPrompt)) {
         cliReady.complete();
         timer.cancel();

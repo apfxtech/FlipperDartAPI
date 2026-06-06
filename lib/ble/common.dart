@@ -202,6 +202,9 @@ abstract class _UniversalBleTransportBase extends _Transport {
   static const String overflowCharUuid = '19ed82ae-ed21-4c9d-4145-228e63fe0000';
   static const String rpcStatusCharUuid =
       '19ed82ae-ed21-4c9d-4145-228e64fe0000';
+  static const int _bleChunkSize = 512;
+  static const int _minBleMtuSize = 20;
+  static const int _maxBleMtuSize = 160;
 
   final BleDiscoveredDevice _device;
   final _BleOps _ops;
@@ -212,7 +215,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
   late final String _rxCharId;
   late final bool _txWithResponse;
   late final bool _rxUsesIndicate;
-  late int _bleChunkSize;
+  late int _bleMtuSize;
 
   String? _overflowSvcId;
   String? _overflowCharId;
@@ -324,7 +327,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
     _rxCharId = rxChar!;
     _txWithResponse = txWithResponse;
     _rxUsesIndicate = rxUsesIndicate;
-    _bleChunkSize = (negotiatedMtu - 3).clamp(20, 512);
+    _bleMtuSize = (negotiatedMtu - 3).clamp(_minBleMtuSize, _maxBleMtuSize);
     _overflowSvcId = overflowSvc;
     _overflowCharId = overflowChar;
     _rpcStatusSvcId = rpcStatusSvc;
@@ -332,7 +335,8 @@ abstract class _UniversalBleTransportBase extends _Transport {
     _rxCharIdLower = _rxCharId.toLowerCase();
     _overflowCharIdLower = _overflowCharId!.toLowerCase();
     LogService.log(
-      '[BLE] mtu=$negotiatedMtu chunk=$_bleChunkSize '
+      '[BLE] negotiatedMtu=$negotiatedMtu chunk=$_bleChunkSize '
+      'mtu=$_bleMtuSize '
       'txWithResponse=$_txWithResponse overflowControl=true rpcStatus=true',
     );
   }
@@ -491,7 +495,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
     var offset = 0;
     while (offset < data.length) {
       if (_closed) throw StateError('BLE transport closed');
-      final chunkEnd = (offset + _bleChunkSize).clamp(0, data.length);
+      final chunkEnd = (offset + _bleMtuSize).clamp(0, data.length);
       final chunkLen = chunkEnd - offset;
       await _waitForBudgetFor(chunkLen);
       if (_closed) throw StateError('BLE transport closed');
