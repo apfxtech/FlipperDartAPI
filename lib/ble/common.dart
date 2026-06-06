@@ -456,24 +456,18 @@ abstract class _UniversalBleTransportBase extends _Transport {
     if (_closed) throw StateError('BLE transport closed');
     if (bytes.isEmpty) return;
 
-    if (!_txWithResponse) {
-      // WWNR: enqueue immediately, overflow-driven sender handles pacing.
-      // Progress is tracked by caller (local frame count), not by BLE write completion.
-      _txQueue.add(_BlePendingSend(bytes, null));
-      final sig = _txDataSignal;
-      _txDataSignal = null;
-      if (sig != null && !sig.isCompleted) sig.complete();
-      _startSender();
-    } else {
-      // WR: enqueue and block until the BLE write is acknowledged.
-      final completer = Completer<void>();
-      _txQueue.add(_BlePendingSend(bytes, completer));
-      final sig = _txDataSignal;
-      _txDataSignal = null;
-      if (sig != null && !sig.isCompleted) sig.complete();
-      _startSender();
-      await completer.future;
-    }
+    // Both WWNR and WR block on a completer, but they fire at different points:
+    //   WWNR — fires when sender *picks up* the frame (RENDEZVOUS, like writeSync +
+    //           onSendCallback in flipper-android). BLE write runs async in background.
+    //           Queue depth stays ≤1 frame; overflow budget is the backpressure.
+    //   WR   — fires after the BLE write is ACK'd by the peer.
+    final completer = Completer<void>();
+    _txQueue.add(_BlePendingSend(bytes, completer));
+    final sig = _txDataSignal;
+    _txDataSignal = null;
+    if (sig != null && !sig.isCompleted) sig.complete();
+    _startSender();
+    await completer.future;
   }
 
   void _startSender() {
@@ -491,24 +485,22 @@ abstract class _UniversalBleTransportBase extends _Transport {
         }
 
         if (_txWithResponse) {
-          // WR: simple sequential send, one frame at a time.
+          // WR: completer fires AFTER BLE ACK (peer confirmed receipt).
           final pending = _txQueue.removeAt(0);
           try {
             await _sendMessage(pending.bytes);
-            final c = pending.completer;
-            if (c != null && !c.isCompleted) c.complete();
+            if (!pending.completer.isCompleted) pending.completer.complete();
           } catch (e) {
-            final c = pending.completer;
-            if (c != null && !c.isCompleted) c.completeError(e);
+            if (!pending.completer.isCompleted) pending.completer.completeError(e);
             if (_closed) break;
             onTransportFault(e);
             break;
           }
         } else {
-          // WWNR: overflow-driven. Wait for firmware to signal available buffer,
-          // then drain up to that many bytes. Sending more than budget per cycle
-          // causes firmware to clamp bytes_ready_to_receive to 0, triggering the
-          // next overflow notification.
+          // WWNR: overflow-driven.
+          // Wait for firmware buffer signal, then drain up to budget bytes.
+          // Each frame's completer fires on PICKUP (before BLE write) so rawWrite
+          // returns and the caller can produce the next frame. BLE write runs async.
           await _waitForOverflowBudget();
           if (_closed) break;
 
@@ -525,6 +517,9 @@ abstract class _UniversalBleTransportBase extends _Transport {
               if (_txQueue.isEmpty) break;
             }
             final pending = _txQueue.removeAt(0);
+            // Signal pickup before the BLE write so the producer (rawWrite caller)
+            // can enqueue the next frame while this one is being sent to the radio.
+            if (!pending.completer.isCompleted) pending.completer.complete();
             try {
               await _sendMessage(pending.bytes);
               cycleRemaining -= pending.bytes.length;
@@ -596,8 +591,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
     final pendings = List<_BlePendingSend>.from(_txQueue);
     _txQueue.clear();
     for (final p in pendings) {
-      final c = p.completer;
-      if (c != null && !c.isCompleted) c.completeError(error);
+      if (!p.completer.isCompleted) p.completer.completeError(error);
     }
   }
 
@@ -714,5 +708,5 @@ enum _BleConnectionPhase { disconnected, connected, disconnecting }
 class _BlePendingSend {
   _BlePendingSend(this.bytes, this.completer);
   final Uint8List bytes;
-  final Completer<void>? completer;
+  final Completer<void> completer;
 }
