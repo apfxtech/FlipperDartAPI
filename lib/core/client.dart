@@ -40,6 +40,7 @@ class FlipperClient {
   FlipperMode _mode = FlipperMode.disconnected;
   int _nextCommandId = 1;
   bool _scanning = false;
+  Completer<void>? _scanPhaseInterrupt;
   bool cliExclusive = false;
   Future<void>? _switchToRpcFuture;
 
@@ -155,6 +156,7 @@ class FlipperClient {
         'rssi=${discovered.rssi} services=${device.services}',
       );
       _rememberDevice(_fromDiscovered(discovered));
+      if (_hasFilteredBleDevice()) _interruptScanPhase();
     };
 
     final filters = _blePlatform.scanFilters.toList(growable: false);
@@ -175,7 +177,9 @@ class FlipperClient {
         );
         phaseResults.clear();
         await uble.UniversalBle.startScan(scanFilter: filter);
-        await Future.delayed(phaseTimeout);
+        final interrupt = _scanPhaseInterrupt = Completer<void>();
+        await Future.any([Future.delayed(phaseTimeout), interrupt.future]);
+        if (identical(_scanPhaseInterrupt, interrupt)) _scanPhaseInterrupt = null;
         await uble.UniversalBle.stopScan();
         final resolved = await _blePlatform.resolveScanResults(phaseResults);
         if (resolved.isNotEmpty) {
@@ -195,10 +199,17 @@ class FlipperClient {
 
   Future<void> stopScan() async {
     if (!_scanning) return;
+    _interruptScanPhase();
     await uble.UniversalBle.stopScan();
     uble.UniversalBle.onScanResult = null;
     _scanning = false;
     _emitDevices();
+  }
+
+  void _interruptScanPhase() {
+    final interrupt = _scanPhaseInterrupt;
+    _scanPhaseInterrupt = null;
+    if (interrupt != null && !interrupt.isCompleted) interrupt.complete();
   }
 
   Future<FlipperDevice> connectById(String id, {FlipperLink? link}) async {
