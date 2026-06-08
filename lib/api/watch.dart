@@ -162,8 +162,8 @@ extension FlipperWatchApi on FlipperClient {
         if (!alive()) break;
       }
 
-      // Storage /ext every 15 s, staggered 500 ms after battery
-      if (alive() && tick % 3 == 0) {
+      // Storage /ext every 30 s, staggered 500 ms after battery
+      if (alive() && tick % 6 == 0) {
         await Future<void>.delayed(const Duration(milliseconds: 500));
         if (!alive()) break;
         try {
