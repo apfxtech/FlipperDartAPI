@@ -236,6 +236,9 @@ class FlipperClient {
       await transport.open();
       _setMode(transport.initialMode);
       _startWorker();
+      if (transport.supportsCli) {
+        unawaited(switchToRpcMode());
+      }
       return device;
     } catch (error) {
       LogService.log(
