@@ -1,15 +1,96 @@
 part of '../flipper_client.dart';
 
 abstract class _UsbPlatform {
+  const _UsbPlatform();
+
+  // Flipper Zero's USB CDC vendor id (STMicroelectronics Virtual COM Port).
+  static const int flipperVid = 0x0483;
+
   Future<List<FlipperDevice>> loadDevices();
 
-  bool includeDevice(FlipperDevice device);
-
   Future<_Transport> openTransport(UsbDiscoveredDevice device);
+
+  // Fires whenever the USB topology changes (device attached / detached) so the
+  // UI can refresh on demand instead of polling on a timer. Platforms without a
+  // native hotplug API return an empty stream.
+  Stream<void> get usbEvents => const Stream<void>.empty();
+
+  // Unified, platform-independent Flipper identification, evaluated against the
+  // already-populated FlipperDevice fields so every platform shares one rule.
+  bool includeDevice(FlipperDevice device) {
+    if (device.vendorId == flipperVid) return true;
+
+    final haystack = [
+      device.id,
+      device.name,
+      device.serialNumber ?? '',
+    ].join(' ').toLowerCase();
+    return haystack.contains('flipper') ||
+        haystack.contains('flip_') ||
+        haystack.contains('stm32') ||
+        haystack.contains('stmicroelectronics') ||
+        haystack.contains('virtual com') ||
+        haystack.contains('usbmodem') ||
+        haystack.contains('usbserial');
+  }
 }
 
-abstract class _SerialUsbPlatformBase implements _UsbPlatform {
+// Desktop serial backends (flutter_libserialport) expose no native hotplug
+// event, so this watcher diffs the cheap port-name list and only emits when the
+// set actually changes — letting the client refresh port metadata (which opens
+// each port) lazily instead of on a hard timer.
+class _SerialPortWatcher {
+  _SerialPortWatcher._();
+  static final _SerialPortWatcher instance = _SerialPortWatcher._();
+
+  static const Duration _interval = Duration(seconds: 1);
+
+  late final StreamController<void> _ctrl = StreamController<void>.broadcast(
+    onListen: _start,
+    onCancel: _stop,
+  );
+  Timer? _timer;
+  List<String> _lastPorts = const [];
+
+  Stream<void> get events => _ctrl.stream;
+
+  void _start() {
+    _lastPorts = _currentPorts();
+    _timer ??= Timer.periodic(_interval, (_) {
+      final ports = _currentPorts();
+      if (_sameAs(ports, _lastPorts)) return;
+      _lastPorts = ports;
+      _ctrl.add(null);
+    });
+  }
+
+  void _stop() {
+    _timer?.cancel();
+    _timer = null;
+  }
+
+  List<String> _currentPorts() {
+    try {
+      return List<String>.from(SerialPort.availablePorts);
+    } catch (_) {
+      return const <String>[];
+    }
+  }
+
+  bool _sameAs(List<String> a, List<String> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+}
+
+abstract class _SerialUsbPlatformBase extends _UsbPlatform {
   const _SerialUsbPlatformBase();
+
+  @override
+  Stream<void> get usbEvents => _SerialPortWatcher.instance.events;
 
   String metadataDescription(SerialPort port) =>
       _readSerialString(() => port.description) ?? '';

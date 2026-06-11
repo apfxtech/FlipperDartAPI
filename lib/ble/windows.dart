@@ -15,15 +15,6 @@ class _WindowsBlePlatform extends _UniversalBlePlatformBase {
   }
 
   @override
-  bool includeDevice(BleDiscoveredDevice device) {
-    final id = device.id.replaceAll(':', '').replaceAll('-', '').toUpperCase();
-    if (id.startsWith('80E127') || id.startsWith('80E126')) return true;
-
-    final name = device.name.toLowerCase();
-    return name.contains('flipper') || name.contains('flip_');
-  }
-
-  @override
   Future<_Transport> openTransport(BleDiscoveredDevice device) {
     return _WindowsBleTransport.create(device);
   }

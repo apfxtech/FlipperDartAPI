@@ -1,7 +1,12 @@
 part of '../flipper_client.dart';
 
-class _AndroidUsbPlatform implements _UsbPlatform {
+class _AndroidUsbPlatform extends _UsbPlatform {
   const _AndroidUsbPlatform();
+
+  // Native USB attach / detach broadcasts — true event-driven discovery.
+  @override
+  Stream<void> get usbEvents =>
+      UsbSerial.usbEventStream?.map((_) {}) ?? const Stream<void>.empty();
 
   @override
   Future<List<FlipperDevice>> loadDevices() async {
@@ -20,33 +25,6 @@ class _AndroidUsbPlatform implements _UsbPlatform {
           ),
         )
         .toList(growable: false);
-  }
-
-  @override
-  bool includeDevice(FlipperDevice device) {
-    final source = device.source;
-    if (source is! AndroidUsbDiscoveredDevice) return false;
-    return includeUsbDevice(source.usbDevice);
-  }
-
-  bool includeUsbDevice(UsbDevice device) {
-    const flipperVid = 0x0483;
-    const flipperPid = 0x5740;
-    if (device.vid == flipperVid && device.pid == flipperPid) return true;
-    if (device.vid == flipperVid) return true;
-
-    final haystack = [
-      device.productName ?? '',
-      device.manufacturerName ?? '',
-      device.deviceName,
-    ].join(' ').toLowerCase();
-    return haystack.contains('flipper') ||
-        haystack.contains('stm32') ||
-        haystack.contains('stmicroelectronics') ||
-        haystack.contains('virtual com') ||
-        haystack.contains('usbmodem') ||
-        haystack.contains('usbserial') ||
-        haystack.contains('flip_');
   }
 
   @override

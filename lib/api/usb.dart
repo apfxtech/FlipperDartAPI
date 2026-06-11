@@ -11,16 +11,13 @@ _UsbPlatform _createUsbPlatform() {
   return const _UnsupportedUsbPlatform();
 }
 
-class _UnsupportedUsbPlatform implements _UsbPlatform {
+class _UnsupportedUsbPlatform extends _UsbPlatform {
   const _UnsupportedUsbPlatform();
 
   @override
   Future<List<FlipperDevice>> loadDevices() async {
     return const <FlipperDevice>[];
   }
-
-  @override
-  bool includeDevice(FlipperDevice device) => false;
 
   @override
   Future<_Transport> openTransport(UsbDiscoveredDevice device) {

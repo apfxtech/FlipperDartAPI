@@ -21,13 +21,6 @@ class _UnsupportedBlePlatform extends _UniversalBlePlatformBase {
   bool includeDevice(BleDiscoveredDevice device) => false;
 
   @override
-  Future<List<BleDiscoveredDevice>> resolveScanResults(
-    Iterable<BleDiscoveredDevice> devices,
-  ) async {
-    return const <BleDiscoveredDevice>[];
-  }
-
-  @override
   Future<_Transport> openTransport(BleDiscoveredDevice device) {
     throw UnsupportedError('BLE transport is not available on this platform');
   }

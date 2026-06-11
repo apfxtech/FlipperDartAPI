@@ -62,6 +62,12 @@ class FlipperClient {
 
   Stream<FlipperRpcException> get errorStream => _errorCtrl.stream;
 
+  // Event-driven USB hotplug signal. On Android these are native attach/detach
+  // broadcasts; on desktop the serial backend emits only when the port set
+  // actually changes. Listeners should call [refreshUsbOnly] in response
+  // instead of polling on a timer.
+  Stream<void> get usbEvents => _usbPlatform.usbEvents;
+
   List<FlipperDevice> get devices =>
       List.unmodifiable(_devices.values.toList());
 
@@ -142,55 +148,34 @@ class FlipperClient {
       return;
     }
 
+    // Instant lookup of already-bonded / connected devices before scanning.
     for (final device in await _blePlatform.loadKnownDevices()) {
       _rememberDevice(_fromDiscovered(device));
     }
 
     _scanning = true;
-    final phaseResults = <BleDiscoveredDevice>[];
     uble.UniversalBle.onScanResult = (device) {
       final discovered = BleDiscoveredDevice(device);
-      phaseResults.add(discovered);
       LogService.log(
         '[BLE] scan result id=${discovered.id} name=${discovered.name} '
         'rssi=${discovered.rssi} services=${device.services}',
       );
       _rememberDevice(_fromDiscovered(discovered));
+      // Stop early as soon as the target Flipper shows up.
       if (_hasFilteredBleDevice()) _interruptScanPhase();
     };
 
-    final filters = _blePlatform.scanFilters.toList(growable: false);
-    final phaseTimeout = filters.length <= 1
-        ? timeout
-        : Duration(
-            milliseconds: (timeout.inMilliseconds ~/ filters.length).clamp(
-              1000,
-              timeout.inMilliseconds,
-            ),
-          );
     try {
-      for (var i = 0; i < filters.length && _scanning; i++) {
-        final filter = filters[i];
-        LogService.log(
-          '[BLE] start scan phase ${i + 1}/${filters.length} '
-          'filterServices=${filter?.withServices ?? const <String>[]}',
-        );
-        phaseResults.clear();
-        await uble.UniversalBle.startScan(scanFilter: filter);
-        final interrupt = _scanPhaseInterrupt = Completer<void>();
-        await Future.any([Future.delayed(phaseTimeout), interrupt.future]);
-        if (identical(_scanPhaseInterrupt, interrupt)) _scanPhaseInterrupt = null;
-        await uble.UniversalBle.stopScan();
-        final resolved = await _blePlatform.resolveScanResults(phaseResults);
-        if (resolved.isNotEmpty) {
-          for (final device in resolved) {
-            _rememberDevice(_fromDiscovered(device));
-          }
-          _emitDevices();
-        }
-        if (_hasFilteredBleDevice()) break;
-      }
+      // Single, platform-independent phase: scan every advertising device.
+      // Flipper identification is name/service based and lives in includeDevice,
+      // so the UI filter toggle can reveal non-Flipper devices on demand.
+      LogService.log('[BLE] start scan (all devices)');
+      await uble.UniversalBle.startScan();
+      final interrupt = _scanPhaseInterrupt = Completer<void>();
+      await Future.any([Future.delayed(timeout), interrupt.future]);
+      if (identical(_scanPhaseInterrupt, interrupt)) _scanPhaseInterrupt = null;
     } finally {
+      await uble.UniversalBle.stopScan();
       uble.UniversalBle.onScanResult = null;
       _scanning = false;
       _emitDevices();

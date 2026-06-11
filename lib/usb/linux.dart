@@ -31,34 +31,6 @@ class _LinuxUsbPlatform extends _SerialUsbPlatformBase {
   }
 
   @override
-  bool includeDevice(FlipperDevice device) {
-    const flipperVid = 0x0483;
-    const flipperPid = 0x5740;
-    if (device.vendorId == flipperVid && device.productId == flipperPid) {
-      return true;
-    }
-
-    final portName = device.id;
-    if (portName.startsWith('/dev/ttyACM') ||
-        portName.startsWith('/dev/ttyUSB')) {
-      return true;
-    }
-
-    final haystack = [
-      device.id,
-      device.name,
-      device.serialNumber ?? '',
-    ].join(' ').toLowerCase();
-    return haystack.contains('flipper') ||
-        haystack.contains('stm32') ||
-        haystack.contains('stmicroelectronics') ||
-        haystack.contains('virtual com') ||
-        haystack.contains('usbmodem') ||
-        haystack.contains('usbserial') ||
-        haystack.contains('flip_');
-  }
-
-  @override
   Future<_Transport> openTransport(UsbDiscoveredDevice device) {
     if (device is! DesktopUsbDiscoveredDevice) {
       throw UnsupportedError('Linux USB transport requires serial device');

@@ -1,15 +1,12 @@
 part of '../flipper_client.dart';
 
-class _IosUsbPlatform implements _UsbPlatform {
+class _IosUsbPlatform extends _UsbPlatform {
   const _IosUsbPlatform();
 
   @override
   Future<List<FlipperDevice>> loadDevices() async {
     return const <FlipperDevice>[];
   }
-
-  @override
-  bool includeDevice(FlipperDevice device) => false;
 
   @override
   Future<_Transport> openTransport(UsbDiscoveredDevice device) {

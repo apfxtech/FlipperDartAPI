@@ -164,15 +164,12 @@ class _UniversalBleOps implements _BleOps {
 abstract class _BlePlatform {
   Future<void> requestPermissions();
 
-  Iterable<uble.ScanFilter?> get scanFilters;
-
+  // Already-bonded / system-known devices. This is an instant lookup, not a
+  // scan, so it is queried once at the start of every scan to surface devices
+  // that are connected but not currently advertising.
   Future<List<BleDiscoveredDevice>> loadKnownDevices();
 
   bool includeDevice(BleDiscoveredDevice device);
-
-  Future<List<BleDiscoveredDevice>> resolveScanResults(
-    Iterable<BleDiscoveredDevice> devices,
-  );
 
   Future<_Transport> openTransport(BleDiscoveredDevice device);
 }
@@ -180,19 +177,36 @@ abstract class _BlePlatform {
 abstract class _UniversalBlePlatformBase implements _BlePlatform {
   const _UniversalBlePlatformBase();
 
-  @override
-  Iterable<uble.ScanFilter?> get scanFilters => const [null];
+  // Flipper Zero's BLE MAC OUI. Present on platforms that expose the MAC
+  // (Android / Linux / Windows); iOS / macOS expose an opaque UUID instead and
+  // fall back to the advertised name.
+  static const List<String> _flipperMacPrefixes = ['80E127', '80E126'];
 
   @override
   Future<List<BleDiscoveredDevice>> loadKnownDevices() async {
     return const <BleDiscoveredDevice>[];
   }
 
+  // Unified, platform-independent Flipper identification. A device is a Flipper
+  // if it advertises the Flipper GATT service, carries the Flipper MAC OUI, or
+  // its advertised name contains "flipper" / "flip_".
   @override
-  Future<List<BleDiscoveredDevice>> resolveScanResults(
-    Iterable<BleDiscoveredDevice> devices,
-  ) async {
-    return const <BleDiscoveredDevice>[];
+  bool includeDevice(BleDiscoveredDevice device) {
+    if (_advertisesFlipperService(device)) return true;
+
+    final id = device.id.replaceAll(':', '').replaceAll('-', '').toUpperCase();
+    if (_flipperMacPrefixes.any(id.startsWith)) return true;
+
+    final name = device.name.toLowerCase();
+    return name.contains('flipper') || name.contains('flip_');
+  }
+
+  bool _advertisesFlipperService(BleDiscoveredDevice device) {
+    bool hasFlipper(Iterable<String> uuids) => uuids
+        .map((uuid) => uuid.toLowerCase())
+        .contains(FlipperClient.bleServiceUuid);
+    return hasFlipper(device.device.services) ||
+        hasFlipper(device.device.serviceData.keys);
   }
 }
 

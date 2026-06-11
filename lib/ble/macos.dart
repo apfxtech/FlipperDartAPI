@@ -166,12 +166,6 @@ class _MacosBlePlatform extends _UniversalBlePlatformBase {
   _MacosBlePlatform();
 
   @override
-  Iterable<uble.ScanFilter?> get scanFilters => [
-    uble.ScanFilter(withServices: const [FlipperClient.bleServiceUuid]),
-    null,
-  ];
-
-  @override
   Future<void> requestPermissions() async {
     try {
       await uble.UniversalBle.requestPermissions();
@@ -194,21 +188,6 @@ class _MacosBlePlatform extends _UniversalBlePlatformBase {
       LogService.log('[FlipperClient] known BLE devices lookup failed: $e');
       return const <BleDiscoveredDevice>[];
     }
-  }
-
-  @override
-  bool includeDevice(BleDiscoveredDevice device) {
-    final services = device.device.services.map((uuid) => uuid.toLowerCase());
-    if (_hasFlipperService(services)) return true;
-    if (_hasFlipperService(device.device.serviceData.keys)) return true;
-    final name = device.name.toLowerCase();
-    return name.contains('flipper') || name.contains('flip_');
-  }
-
-  bool _hasFlipperService(Iterable<String> services) {
-    return services
-        .map((uuid) => uuid.toLowerCase())
-        .contains(FlipperClient.bleServiceUuid);
   }
 
   @override

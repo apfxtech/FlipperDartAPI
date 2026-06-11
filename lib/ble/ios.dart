@@ -4,11 +4,6 @@ class _IosBlePlatform extends _UniversalBlePlatformBase {
   const _IosBlePlatform();
 
   @override
-  Iterable<uble.ScanFilter?> get scanFilters => [
-    uble.ScanFilter(withServices: const [FlipperClient.bleServiceUuid]),
-  ];
-
-  @override
   Future<void> requestPermissions() async {
     try {
       await uble.UniversalBle.requestPermissions();
@@ -32,9 +27,6 @@ class _IosBlePlatform extends _UniversalBlePlatformBase {
       return const <BleDiscoveredDevice>[];
     }
   }
-
-  @override
-  bool includeDevice(BleDiscoveredDevice device) => true;
 
   @override
   Future<_Transport> openTransport(BleDiscoveredDevice device) {
