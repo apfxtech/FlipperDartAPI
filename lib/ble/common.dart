@@ -661,11 +661,9 @@ abstract class _UniversalBleTransportBase extends _Transport {
       _clearBleCallbacks();
       return;
     }
-    // Arm signal and phase before any async call so a platform disconnect
-    // event that fires during _readConnectionState() completes the signal
-    // instead of being silently dropped.
     _connectionPhase = _BleConnectionPhase.disconnecting;
-    _disconnectSignal = Completer<void>();
+    final disconnectSignal = Completer<void>();
+    _disconnectSignal = disconnectSignal;
     final state = await _readConnectionState();
     if (state == _BleConnState.disconnected) {
       _markBleDisconnected();
@@ -679,7 +677,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
       if (stateAfterDisconnect == _BleConnState.disconnected) {
         _markBleDisconnected();
       }
-      await _disconnectSignal!.future.timeout(
+      await disconnectSignal.future.timeout(
         const Duration(seconds: 5),
         onTimeout: () {
           LogService.log('[BLE] disconnect event timeout after close request');
