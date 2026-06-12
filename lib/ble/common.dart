@@ -125,6 +125,16 @@ class _UniversalBleOps implements _BleOps {
     Uint8List data, {
     bool withoutResponse = false,
   }) async {
+    // Per-chunk hot path: skip the stopwatch and message building in release.
+    if (!LogService.enabled) {
+      return uble.UniversalBle.write(
+        deviceId,
+        svcId,
+        charId,
+        data,
+        withoutResponse: withoutResponse,
+      );
+    }
     final stopwatch = Stopwatch()..start();
     final mode = withoutResponse ? 'withoutResponse' : 'withResponse';
     try {
@@ -239,6 +249,11 @@ abstract class _UniversalBleTransportBase extends _Transport {
   // them pending forever); bonded-link re-encryption also happens inside this
   // step.
   static const Duration _connectTimeout = Duration(seconds: 20);
+  // Bound for individual GATT operations (MTU, discovery, subscriptions,
+  // characteristic reads) during session setup.
+  static const Duration _gattOpTimeout = Duration(seconds: 15);
+  // Bound for a single ATT write callback before it is treated as lost.
+  static const Duration _writeCallbackTimeout = Duration(seconds: 15);
   // TX stall watchdog: with data pending, the firmware must grant credit /
   // activate the session well within this window; silence means the session
   // is dead and every queued task must settle instead of hanging.
@@ -287,6 +302,8 @@ abstract class _UniversalBleTransportBase extends _Transport {
 
   Completer<void>? _disconnectSignal;
   bool _senderRunning = false;
+  int _writeTimeoutStreak = 0;
+  static const int _maxWriteTimeoutStreak = 2;
   _BleLinkState _link = _BleLinkState.disconnected;
   bool _platformConnectionEstablished = false;
 
@@ -349,14 +366,28 @@ abstract class _UniversalBleTransportBase extends _Transport {
   Future<void> _configureConnected(String deviceId) async {
     int negotiatedMtu = 23;
     try {
-      negotiatedMtu = await _ops.requestMtu(deviceId, 517);
+      negotiatedMtu = await _ops
+          .requestMtu(deviceId, 517)
+          .timeout(_gattOpTimeout);
     } catch (e) {
       LogService.log(
         '[BLE] requestMtu failed: $e (using default $negotiatedMtu)',
       );
     }
 
-    final services = await _ops.discoverServices(deviceId);
+    // Every GATT step is bounded: a platform stack that never answers (a
+    // classic CoreBluetooth/BlueZ failure mode) would otherwise wedge the
+    // lifecycle chain forever — including the user's disconnect().
+    final List<_BleService> services;
+    try {
+      services = await _ops
+          .discoverServices(deviceId)
+          .timeout(_gattOpTimeout);
+    } on TimeoutException {
+      throw FlipperTransportError(
+        'BLE service discovery timed out after ${_gattOpTimeout.inSeconds}s',
+      );
+    }
     String? txSvc;
     String? txChar;
     String? rxSvc;
@@ -445,23 +476,30 @@ abstract class _UniversalBleTransportBase extends _Transport {
     _link = _BleLinkState.connected;
 
     final deviceId = _device.device.deviceId;
-    if (_rxUsesIndicate) {
-      await _ops.subscribeIndications(deviceId, _rxSvcId, _rxCharId);
-    } else {
-      await _ops.subscribeNotifications(deviceId, _rxSvcId, _rxCharId);
-    }
+    try {
+      if (_rxUsesIndicate) {
+        await _ops
+            .subscribeIndications(deviceId, _rxSvcId, _rxCharId)
+            .timeout(_gattOpTimeout);
+      } else {
+        await _ops
+            .subscribeNotifications(deviceId, _rxSvcId, _rxCharId)
+            .timeout(_gattOpTimeout);
+      }
 
-    await _ops.subscribeNotifications(
-      deviceId,
-      _overflowSvcId!,
-      _overflowCharId!,
-    );
-    final initialBudget = await _ops.read(
-      deviceId,
-      _overflowSvcId!,
-      _overflowCharId!,
-    );
-    _applyOverflowValue(initialBudget);
+      await _ops
+          .subscribeNotifications(deviceId, _overflowSvcId!, _overflowCharId!)
+          .timeout(_gattOpTimeout);
+      final initialBudget = await _ops
+          .read(deviceId, _overflowSvcId!, _overflowCharId!)
+          .timeout(_gattOpTimeout);
+      _applyOverflowValue(initialBudget);
+    } on TimeoutException {
+      throw FlipperTransportError(
+        'BLE session setup (subscriptions / overflow read) timed out '
+        'after ${_gattOpTimeout.inSeconds}s',
+      );
+    }
 
     await _subscribeRpcStatus(deviceId);
     await _openExtra();
@@ -546,7 +584,11 @@ abstract class _UniversalBleTransportBase extends _Transport {
     }
     _budget = remaining;
     _budgetGen += 1;
-    LogService.log('[BLE] credit granted: $remaining bytes (gen $_budgetGen)');
+    if (LogService.enabled) {
+      LogService.log(
+        '[BLE] credit granted: $remaining bytes (gen $_budgetGen)',
+      );
+    }
     final signal = _budgetSignal;
     _budgetSignal = null;
     _fireSignal(signal);
@@ -720,19 +762,35 @@ abstract class _UniversalBleTransportBase extends _Transport {
       }
       final chunkEnd = (offset + _bleMtuSize).clamp(0, data.length);
       try {
-        await _ops.write(
-          _device.device.deviceId,
-          _txSvcId,
-          _txCharId,
-          Uint8List.sublistView(data, offset, chunkEnd),
-          withoutResponse: !_txWithResponse,
-        );
+        // The explicit timeout also covers platform stacks whose write future
+        // silently never completes — without it the sender (and its stall
+        // watchdog, which runs in this same loop) would hang forever.
+        await _ops
+            .write(
+              _device.device.deviceId,
+              _txSvcId,
+              _txCharId,
+              Uint8List.sublistView(data, offset, chunkEnd),
+              withoutResponse: !_txWithResponse,
+            )
+            .timeout(_writeCallbackTimeout);
+        _writeTimeoutStreak = 0;
       } on TimeoutException {
         // The platform callback can be lost after an acknowledged ATT write.
         // Retrying is unsafe: the peripheral may already have consumed the
         // bytes. Continue once; overflow control and the RPC ACK verify the
         // stream without duplicating this chunk or dropping the BLE link.
+        // Two in a row mean the link itself is gone — if the write truly
+        // vanished, the byte stream now has a hole and the firmware will
+        // declare ERROR_DECODE anyway; fault with the honest reason instead.
         if (!_txWithResponse) rethrow;
+        _writeTimeoutStreak++;
+        if (_writeTimeoutStreak >= _maxWriteTimeoutStreak) {
+          throw FlipperTransportError(
+            '$_writeTimeoutStreak consecutive BLE write callbacks lost; '
+            'link presumed dead',
+          );
+        }
         LogService.log(
           '[BLE] write callback timed out; continuing without retry',
         );

@@ -139,6 +139,10 @@ extension FlipperWatchApi on FlipperClient {
     while (alive()) {
       await Future<void>.delayed(interval);
       if (!alive()) break;
+      // A CLI session owns the transport: polling would only throw
+      // "RPC switch blocked" every tick and spam the log. Skip quietly and
+      // resume once the client is back in RPC mode.
+      if (_mode != FlipperMode.rpc || cliExclusive) continue;
       tick++;
 
       // Battery: partial every 5 s, full every 15 s

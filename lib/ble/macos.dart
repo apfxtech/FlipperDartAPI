@@ -20,30 +20,40 @@ class _NativeMacosOps implements _BleOps {
   static void _dispatch(dynamic raw) {
     final ops = _instance;
     if (ops == null) return;
-    final event = raw as Map<Object?, Object?>;
-    final type = event['type'] as String;
+    // Defensive decoding: a malformed native event must not throw out of the
+    // event-channel listener (an unhandled error there is pure noise and the
+    // rest of the batch would be lost).
+    final event = raw is Map<Object?, Object?> ? raw : null;
+    final type = event?['type'];
+    if (event == null || type is! String) {
+      LogService.log('[BLE] macOS: unrecognized native event: $raw');
+      return;
+    }
+    final deviceId = event['deviceId'];
+    if (deviceId is! String) {
+      LogService.log('[BLE] macOS: native event without deviceId: $type');
+      return;
+    }
     switch (type) {
       case 'connectionChange':
         final error = event['error'];
+        final connected = event['connected'];
         ops._onConn?.call(
-          event['deviceId'] as String,
-          event['connected'] as bool,
+          deviceId,
+          connected is bool ? connected : false,
           error is String ? error : null,
         );
       case 'valueChange':
         // FlutterStandardTypedData → Uint8List is decoded automatically by codec
-        final raw = event['value'];
-        final bytes = raw is Uint8List
-            ? raw
-            : raw is List
-            ? Uint8List.fromList(raw.cast<int>())
+        final value = event['value'];
+        final bytes = value is Uint8List
+            ? value
+            : value is List
+            ? Uint8List.fromList(value.cast<int>())
             : Uint8List(0);
-        ops._onValue?.call(
-          event['deviceId'] as String,
-          event['charUuid'] as String,
-          bytes,
-          null,
-        );
+        final charUuid = event['charUuid'];
+        if (charUuid is! String) return;
+        ops._onValue?.call(deviceId, charUuid, bytes, null);
     }
   }
 

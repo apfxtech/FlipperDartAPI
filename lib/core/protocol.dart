@@ -56,6 +56,7 @@ class _FrameBufferPendingState {
 
 class _FrameBuffer {
   static const _initialCapacity = 512;
+  static const _shrinkThreshold = 8192;
   Uint8List _buf = Uint8List(_initialCapacity);
   int _writePos = 0;
   int _readPos = 0;
@@ -92,7 +93,15 @@ class _FrameBuffer {
       if (frame == null) break;
       messages.add(frame);
     }
-    if (_readPos > 4096) {
+    if (_readPos == _writePos) {
+      _readPos = 0;
+      _writePos = 0;
+      // Fully drained: release the capacity a peak frame forced (the buffer
+      // would otherwise hold up to ~128 KB for the rest of the session).
+      if (_buf.length > _shrinkThreshold) {
+        _buf = Uint8List(_initialCapacity);
+      }
+    } else if (_readPos > 4096) {
       final unread = _writePos - _readPos;
       _buf.setRange(0, unread, _buf, _readPos);
       _writePos = unread;
@@ -100,7 +109,9 @@ class _FrameBuffer {
     }
 
     _FrameBufferPendingState? pending;
-    if (_readPos < _writePos) {
+    // Diagnostics only (hex preview + varint walk): never burn this on the
+    // RX hot path in release builds.
+    if (LogService.enabled && _readPos < _writePos) {
       pending = _describePending();
     }
     return _FrameBufferPushResult(messages, pending);
@@ -177,6 +188,17 @@ class _FrameBuffer {
           _readPos += 1;
           onParseError?.call(
             FormatException('Bad protobuf varint length: $length'),
+          );
+          return null;
+        }
+        if (length == 0) {
+          // The firmware never sends an empty Main; a zero-length frame is
+          // noise (e.g. a stray 0x00 after desync) and must count toward the
+          // desync streak instead of resetting it with a fake empty message.
+          LogService.log('[FrameBuffer] empty frame, dropping first byte');
+          _readPos += 1;
+          onParseError?.call(
+            const FormatException('Zero-length protobuf frame'),
           );
           return null;
         }

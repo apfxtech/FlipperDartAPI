@@ -92,7 +92,18 @@ class _AndroidUsbTransport extends _Transport {
     if (!isActive) {
       throw StateError('Transport closed');
     }
-    await _port.write(bytes);
+    try {
+      // The plugin offers no write timeout of its own; a hung native write
+      // would block the TX worker forever and with it every queued request.
+      await _port.write(bytes).timeout(const Duration(seconds: 10));
+    } on TimeoutException {
+      final error = FlipperTransportError(
+        'Android USB write timed out (${bytes.length} bytes); '
+        'port presumed dead',
+      );
+      onTransportFault(error);
+      throw error;
+    }
   }
 
   @override

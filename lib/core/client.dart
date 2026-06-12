@@ -80,6 +80,17 @@ class FlipperClient {
   bool _scanning = false;
   Completer<void>? _scanPhaseInterrupt;
 
+  // Devices-stream throttle: scan results arrive per advertising packet
+  // (tens per second); listeners get at most one event per window plus a
+  // trailing one for the final state.
+  static const Duration _devicesEmitWindow = Duration(milliseconds: 200);
+  Timer? _devicesEmitTimer;
+  bool _devicesEmitDirty = false;
+
+  // CLI commands are request/response over a shared text stream; two
+  // interleaved executeCli calls would corrupt each other's output.
+  Future<void> _cliChain = Future.value();
+
   Stream<List<FlipperDevice>> get devicesStream => _devicesCtrl.stream;
 
   Stream<FlipperConnectionState> get connectionStream => _connectionCtrl.stream;
@@ -121,12 +132,22 @@ class FlipperClient {
     final cached = getName();
     if (cached != null && cached.isNotEmpty) return cached;
 
-    _ensureDeviceInfoFetch();
-    await deviceInfoUpdates.firstWhere(
-      (patch) =>
+    // Resolves as soon as the name arrives mid-fetch; a failed fetch surfaces
+    // its error instead of leaving the caller waiting on a stream that will
+    // never emit.
+    final fetch = _ensureDeviceInfoFetch();
+    final nameArrived = Completer<void>();
+    final sub = deviceInfoUpdates.listen((patch) {
+      final hasName =
           (patch['hardware_name']?.isNotEmpty ?? false) ||
-          (patch['device_name']?.isNotEmpty ?? false),
-    );
+          (patch['device_name']?.isNotEmpty ?? false);
+      if (hasName && !nameArrived.isCompleted) nameArrived.complete();
+    });
+    try {
+      await Future.any([nameArrived.future, fetch]);
+    } finally {
+      await sub.cancel();
+    }
 
     final name = getName();
     if (name == null || name.isEmpty) {
@@ -135,10 +156,10 @@ class FlipperClient {
     return name;
   }
 
-  Future<Map<String, String>> awaitDeviceInfo() {
-    if (_deviceInfoFetched) return Future.value(deviceInfoCache);
-    _ensureDeviceInfoFetch();
-    return deviceInfoStream.first;
+  Future<Map<String, String>> awaitDeviceInfo() async {
+    if (_deviceInfoFetched) return deviceInfoCache;
+    await _ensureDeviceInfoFetch();
+    return deviceInfoCache;
   }
 
   FlipperMode get mode => _mode;
@@ -163,8 +184,13 @@ class FlipperClient {
     Duration bleTimeout = const Duration(seconds: 10),
   }) async {
     _devices.clear();
+    // The connected device stays listed even though it no longer advertises /
+    // enumerates while a session holds it; dropping it would also break
+    // connectById for the active id.
+    final connected = _connectedDevice;
+    if (connected != null) _rememberDevice(connected);
     await _loadUsbDevices();
-    _emitDevices();
+    _emitDevices(immediate: true);
     await scanBle(timeout: bleTimeout);
     return devices;
   }
@@ -177,42 +203,59 @@ class FlipperClient {
 
   Future<void> scanBle({Duration timeout = const Duration(seconds: 10)}) async {
     if (_scanning) return;
-
-    final state = await uble.UniversalBle.getBluetoothAvailabilityState();
-    if (state != uble.AvailabilityState.poweredOn) {
-      LogService.log('[FlipperClient] BLE adapter state: $state');
-      return;
-    }
-
-    for (final device in await _blePlatform.loadKnownDevices()) {
-      _rememberDevice(_fromDiscovered(device));
-    }
-
+    // The flag goes up before the first await: two concurrent calls would
+    // otherwise both pass the guard and fight over the global scan callback.
     _scanning = true;
-    uble.UniversalBle.onScanResult = (device) {
-      final discovered = BleDiscoveredDevice(device);
-      LogService.log(
-        '[BLE] scan result id=${discovered.id} name=${discovered.name} '
-        'rssi=${discovered.rssi} services=${device.services}',
-      );
-      _rememberDevice(_fromDiscovered(discovered));
-      if (_hasFilteredBleDevice()) _interruptScanPhase();
-    };
 
     try {
+      // Scanning competes with an active BLE link for the radio (on macOS a
+      // second CBCentralManager halves effective throughput and provokes
+      // drops); USB sessions are unaffected.
+      if (_transport != null && (_connectedDevice?.isBle ?? false)) {
+        LogService.log('[BLE] scan skipped: BLE session is active');
+        return;
+      }
+
+      final state = await uble.UniversalBle.getBluetoothAvailabilityState();
+      if (state != uble.AvailabilityState.poweredOn) {
+        LogService.log('[FlipperClient] BLE adapter state: $state');
+        return;
+      }
+
+      for (final device in await _blePlatform.loadKnownDevices()) {
+        _rememberDevice(_fromDiscovered(device));
+      }
+
+      uble.UniversalBle.onScanResult = (device) {
+        final discovered = BleDiscoveredDevice(device);
+        if (LogService.enabled) {
+          LogService.log(
+            '[BLE] scan result id=${discovered.id} name=${discovered.name} '
+            'rssi=${discovered.rssi} services=${device.services}',
+          );
+        }
+        _rememberDevice(_fromDiscovered(discovered));
+        if (_hasFilteredBleDevice()) _interruptScanPhase();
+      };
+
       // Single phase scanning every advertising device: Flipper identification
       // is name/service based (includeDevice), so the UI filter can also
       // reveal non-Flipper devices on demand.
       LogService.log('[BLE] scan started');
       await uble.UniversalBle.startScan();
-      final interrupt = _scanPhaseInterrupt = Completer<void>();
-      await Future.any([Future.delayed(timeout), interrupt.future]);
-      if (identical(_scanPhaseInterrupt, interrupt)) _scanPhaseInterrupt = null;
+      try {
+        final interrupt = _scanPhaseInterrupt = Completer<void>();
+        await Future.any([Future.delayed(timeout), interrupt.future]);
+        if (identical(_scanPhaseInterrupt, interrupt)) {
+          _scanPhaseInterrupt = null;
+        }
+      } finally {
+        await uble.UniversalBle.stopScan();
+        uble.UniversalBle.onScanResult = null;
+      }
     } finally {
-      await uble.UniversalBle.stopScan();
-      uble.UniversalBle.onScanResult = null;
       _scanning = false;
-      _emitDevices();
+      _emitDevices(immediate: true);
     }
   }
 
@@ -222,7 +265,7 @@ class FlipperClient {
     await uble.UniversalBle.stopScan();
     uble.UniversalBle.onScanResult = null;
     _scanning = false;
-    _emitDevices();
+    _emitDevices(immediate: true);
   }
 
   void _interruptScanPhase() {
@@ -264,6 +307,10 @@ class FlipperClient {
   // up and must not be touched. Reconnects in place when allowed, otherwise
   // tears down with the original reason.
   void _scheduleFaultRecovery(int gen, Object reason) {
+    // Freeze the uptime now: the recovery op runs later through the chain and
+    // must judge the dead session by its actual lifetime, not by how long the
+    // recovery sat in the queue.
+    if (gen == _sessionGen) _sessionUptime.stop();
     unawaited(
       _serialized(() async {
         if (gen != _sessionGen) return;
@@ -278,7 +325,9 @@ class FlipperClient {
   }
 
   bool _mayAutoReconnect() {
-    if (_sessionUptime.isRunning && _sessionUptime.elapsed >= _quickDropWindow) {
+    // The stopwatch is already stopped at fault time, so isRunning must not
+    // gate the healthy-session check.
+    if (_sessionUptime.elapsed >= _quickDropWindow) {
       _quickDropStreak = 0;
     }
     if (_quickDropStreak >= _maxQuickDropStreak) {
@@ -573,25 +622,25 @@ class FlipperClient {
       return;
     }
 
-    final promptSeen = await _waitForTextMatch(
-      (text) => text.contains(FlipperClient.cliPrompt),
+    final promptSeen = await _waitForTextMarker(
+      FlipperClient.cliPrompt,
       timeout: const Duration(seconds: 5),
       trigger: transport.nudgeCli,
     );
     LogService.log(
-      promptSeen
+      promptSeen != null
           ? '[RPC] CLI prompt detected'
           : '[RPC] CLI prompt not seen within 5s, continuing',
     );
     if (!identical(_transport, transport)) return;
 
-    final echoed = await _waitForTextMatch(
-      (text) => text.contains('start_rpc_session'),
+    final echoed = await _waitForTextMarker(
+      'start_rpc_session',
       timeout: const Duration(seconds: 2),
       trigger: () => transport.writeAscii(FlipperClient.startRpcSession),
     );
     LogService.log(
-      echoed
+      echoed != null
           ? '[RPC] start_rpc_session echo received'
           : '[RPC] start_rpc_session echo not seen, may already be in RPC mode',
     );
@@ -631,9 +680,22 @@ class FlipperClient {
 
   Future<void> enterCliMode() => switchToCliMode();
 
+  // Serialized through _cliChain: concurrent calls would interleave their
+  // writes on the shared text stream and corrupt each other's output.
   Future<String> executeCli(
     String command, {
     Duration timeout = const Duration(seconds: 5),
+  }) {
+    final result = _cliChain.then(
+      (_) => _executeCliInner(command, timeout: timeout),
+    );
+    _cliChain = result.then<void>((_) {}, onError: (_) {});
+    return result;
+  }
+
+  Future<String> _executeCliInner(
+    String command, {
+    required Duration timeout,
   }) async {
     if (!_requireTransport().supportsCli) {
       throw FlipperUnsupportedModeError(
@@ -644,13 +706,8 @@ class FlipperClient {
       await switchToCliMode();
     }
     final transport = _requireTransport();
-    String result = '';
-    final matched = await _waitForTextMatch(
-      (text) {
-        if (!text.contains(FlipperClient.cliPrompt)) return false;
-        result = _trimCliResult(text, command);
-        return true;
-      },
+    final text = await _waitForTextMarker(
+      FlipperClient.cliPrompt,
       timeout: timeout,
       trigger: () async {
         await transport.writeAscii('\r');
@@ -658,10 +715,10 @@ class FlipperClient {
         await transport.writeAscii('$command\r');
       },
     );
-    if (!matched) {
+    if (text == null) {
       throw TimeoutException('CLI command timeout: $command');
     }
-    return result;
+    return _trimCliResult(text, command);
   }
 
   Future<void> writeCliText(String text) async {
@@ -692,9 +749,13 @@ class FlipperClient {
 
   Future<List<FlipperDevice>> refreshUsbOnly() async {
     final usbKeyPrefix = '${FlipperLink.usb.name}:';
-    _devices.removeWhere((key, _) => key.startsWith(usbKeyPrefix));
+    final connected = _connectedDevice;
+    _devices.removeWhere(
+      (key, device) =>
+          key.startsWith(usbKeyPrefix) && !identical(device, connected),
+    );
     await _loadUsbDevices();
-    _emitDevices();
+    _emitDevices(immediate: true);
     return devices;
   }
 
@@ -708,6 +769,7 @@ class FlipperClient {
   Future<void> sendRpc(
     Main message, {
     FlipperRequestPriority priority = FlipperRequestPriority.defaultPriority,
+    Duration sendTimeout = const Duration(seconds: 30),
   }) async {
     if (_mode != FlipperMode.rpc) {
       await switchToRpcMode();
@@ -716,20 +778,34 @@ class FlipperClient {
       message.commandId = nextCommandId();
     }
     final sent = Completer<void>();
-    _enqueueRequest(
-      _QueuedRequest(
-        frame: message,
-        priority: priority,
-        seq: _requestSeq++,
-        onSent: () {
-          if (!sent.isCompleted) sent.complete();
-        },
-        onError: (error) {
-          if (!sent.isCompleted) sent.completeError(error);
-        },
-      ),
+    final queued = _QueuedRequest(
+      frame: message,
+      priority: priority,
+      seq: _requestSeq++,
+      onSent: () {
+        if (!sent.isCompleted) sent.complete();
+      },
+      onError: (error) {
+        if (!sent.isCompleted) sent.completeError(error);
+      },
     );
-    await sent.future;
+    _enqueueRequest(queued);
+    // A hung transport write must surface as an error, not an infinite await.
+    final timer = Timer(sendTimeout, () {
+      if (sent.isCompleted) return;
+      _requestQueue.remove(queued);
+      queued.fail(
+        TimeoutException(
+          'RPC send timeout after ${sendTimeout.inSeconds}s '
+          'for ${queued.describe()}',
+        ),
+      );
+    });
+    try {
+      await sent.future;
+    } finally {
+      timer.cancel();
+    }
   }
 
   Future<List<Main>> callRpcFrames(
@@ -737,6 +813,7 @@ class FlipperClient {
     Duration timeout = const Duration(seconds: 8),
     FlipperRequestPriority priority = FlipperRequestPriority.defaultPriority,
     void Function(Main frame)? onFrame,
+    bool retainFrames = true,
   }) async {
     if (_mode != FlipperMode.rpc) {
       await switchToRpcMode();
@@ -746,7 +823,9 @@ class FlipperClient {
         : request.commandId;
     request.commandId = commandId;
 
-    final pending = _PendingRpc(commandId)..onFrame = onFrame;
+    final pending = _PendingRpc(commandId)
+      ..onFrame = onFrame
+      ..retainFrames = retainFrames;
     _pendingRpc[commandId] = pending;
 
     _enqueueRequest(
@@ -754,17 +833,23 @@ class FlipperClient {
         frame: request,
         priority: priority,
         seq: _requestSeq++,
-        onSent: () => pending.armTimeout(timeout, () {
-          _onRpcTimeout(
-            commandId,
-            'RPC timeout for commandId=$commandId '
-            'after ${timeout.inSeconds}s '
-            'framesReceived=${pending.frames.length}',
-          );
-        }),
+        onSent: () {
+          pending.started = true;
+          pending.rearmTimeout();
+        },
         onError: (error) => _failPendingById(commandId, error),
       ),
     );
+    // Armed at enqueue, not at TX: a write that never completes (hung
+    // platform stack) must not leave the caller waiting forever.
+    pending.armTimeout(timeout, () {
+      _onRpcTimeout(
+        commandId,
+        'RPC timeout for commandId=$commandId '
+        'after ${timeout.inSeconds}s started=${pending.started} '
+        'framesReceived=${pending.frameCount}',
+      );
+    });
 
     try {
       return await pending.future;
@@ -800,6 +885,7 @@ class FlipperClient {
           commandId,
           'Multi-frame RPC timeout waiting for ACK commandId=$commandId '
           'after ${timeout.inSeconds}s finalFrameSent=$finalFrameSent '
+          'started=${pending.started} '
           'queued=${_requestQueue.length} pending=${_pendingRpc.keys.toList()}',
         );
       });
@@ -816,6 +902,7 @@ class FlipperClient {
           seq: _requestSeq++,
           onSent: () {
             if (isFinal) finalFrameSent = true;
+            pending.started = true;
             armOrRearmTimeout();
             if (!sent.isCompleted) sent.complete();
           },
@@ -824,6 +911,9 @@ class FlipperClient {
           },
         ),
       );
+      // Armed at enqueue (see callRpcFrames): a frame stuck before TX must
+      // still time out instead of hanging the upload body forever.
+      armOrRearmTimeout();
       return sent.future;
     }
 
@@ -1038,7 +1128,11 @@ class FlipperClient {
         // schedules the teardown.
         continue;
       }
-      LogService.log('[RPC] tx ok ${request.describe()} bytes=${encoded.length}');
+      if (LogService.enabled) {
+        LogService.log(
+          '[RPC] tx ok ${request.describe()} bytes=${encoded.length}',
+        );
+      }
 
       if (frame.commandId != 0 && frame.hasNext) {
         _txGroupCommandId = frame.commandId;
@@ -1138,16 +1232,25 @@ class FlipperClient {
     if (_mode == FlipperMode.rpc) {
       final result = _frameBuffer.push(chunk, onParseError: _onFrameParseError);
       if (result.frames.isEmpty) {
-        LogService.log(
-          '[RPC] rx ${chunk.length} bytes buffered '
-          '(${result.pendingState ?? 'no pending frame'})',
-        );
+        if (LogService.enabled) {
+          LogService.log(
+            '[RPC] rx ${chunk.length} bytes buffered '
+            '(${result.pendingState ?? 'no pending frame'})',
+          );
+        }
         return;
       }
       for (final frame in result.frames) {
-        _routeFrame(frame);
+        // A throwing listener (messageStream subscriber, select() transform)
+        // must not abort the loop: the remaining frames of this chunk would
+        // be lost and their commands would time out.
+        try {
+          _routeFrame(frame);
+        } catch (error) {
+          LogService.log('[RPC] frame routing threw: $error');
+        }
       }
-      if (result.pendingState != null) {
+      if (LogService.enabled && result.pendingState != null) {
         LogService.log(
           '[RPC] parsed ${result.frames.length} frame(s), residual '
           '${result.pendingState}',
@@ -1157,14 +1260,24 @@ class FlipperClient {
     }
 
     final text = _utf8Decoder.convert(chunk);
-    LogService.log(
-      '[CLI] rx: ${text.replaceAll('\r', '\\r').replaceAll('\n', '\\n')}',
-    );
+    if (LogService.enabled) {
+      LogService.log(
+        '[CLI] rx: ${text.replaceAll('\r', '\\r').replaceAll('\n', '\\n')}',
+      );
+    }
     _textCtrl.add(text);
   }
 
   void _routeFrame(Main frame) {
-    _rxParseErrorStreak = 0;
+    // Random bytes occasionally survive Main.fromBuffer (protobuf tolerates
+    // unknown fields), so a parsed frame alone does not prove the stream is
+    // healthy — a desynchronized session could otherwise alternate between
+    // parse errors and accidental "successes" forever. Only frames that match
+    // an in-flight command or carry recognizable content reset the streak.
+    if (frame.whichContent() != Main_Content.notSet ||
+        _pendingRpc.containsKey(frame.commandId)) {
+      _rxParseErrorStreak = 0;
+    }
     _messageCtrl.add(frame);
 
     if (frame.hasSystemDeviceInfoResponse()) {
@@ -1181,7 +1294,12 @@ class FlipperClient {
 
     final commandId = frame.commandId;
     if (commandId == 0) {
-      LogService.log('[RPC] rx broadcast content=${frame.whichContent().name}');
+      if (LogService.enabled) {
+        // Broadcasts arrive at screen-streaming frame rate; keep this cheap.
+        LogService.log(
+          '[RPC] rx broadcast content=${frame.whichContent().name}',
+        );
+      }
       final error = _exceptionFromResponse(frame);
       if (error != null && !_errorCtrl.isClosed) {
         _errorCtrl.add(error);
@@ -1205,16 +1323,29 @@ class FlipperClient {
 
     final pending = _pendingRpc[commandId];
     if (pending == null) {
+      if (frame.commandStatus ==
+          CommandStatus.ERROR_CONTINUOUS_COMMAND_INTERRUPTED) {
+        // Expected aftermath of a timed-out multi-frame command: the firmware
+        // closes the abandoned write stream when the next command arrives and
+        // reports it against the old (already failed) commandId.
+        LogService.log(
+          '[RPC] firmware closed interrupted stream cmdId=$commandId '
+          '(command already timed out locally)',
+        );
+        return;
+      }
       LogService.log('[RPC] rx unmatched frame cmdId=$commandId');
       return;
     }
 
-    LogService.log(
-      '[RPC] rx frame cmdId=$commandId hasNext=${frame.hasNext} '
-      'status=${frame.commandStatus.name} '
-      'content=${frame.whichContent().name} '
-      'frameN=${pending.frames.length + 1}',
-    );
+    if (LogService.enabled) {
+      LogService.log(
+        '[RPC] rx frame cmdId=$commandId hasNext=${frame.hasNext} '
+        'status=${frame.commandStatus.name} '
+        'content=${frame.whichContent().name} '
+        'frameN=${pending.frameCount + 1}',
+      );
+    }
     pending.add(frame);
 
     if (frame.hasNext) {
@@ -1251,37 +1382,49 @@ class FlipperClient {
 
   Future<void> _ensureCliPrompt() async {
     final transport = _requireTransport();
-    final seen = await _waitForTextMatch(
-      (text) => text.contains(FlipperClient.cliPrompt),
+    final seen = await _waitForTextMarker(
+      FlipperClient.cliPrompt,
       timeout: const Duration(seconds: 5),
       trigger: transport.nudgeCli,
     );
-    if (!seen) {
+    if (seen == null) {
       throw TimeoutException('CLI prompt timeout');
     }
   }
 
-  // Listens on textStream until the accumulated text satisfies [test] or
-  // [timeout] elapses; a timeout is a result, not an exception. [trigger]
-  // runs after the listener is attached; its write errors surface as a
-  // non-match.
-  Future<bool> _waitForTextMatch(
-    bool Function(String text) test, {
+  // Listens on textStream until [marker] appears in the accumulated text or
+  // [timeout] elapses. Returns the full accumulated text on match, null on
+  // timeout — a timeout is a result, not an exception. [trigger] runs after
+  // the listener is attached; its write errors surface as a non-match.
+  //
+  // The marker is searched in a rolling tail window (last chunk plus
+  // marker-1 carry-over chars), so cost stays O(chunk) per event instead of
+  // re-scanning the whole accumulated text — large CLI outputs used to make
+  // this quadratic.
+  Future<String?> _waitForTextMarker(
+    String marker, {
     required Duration timeout,
     Future<void> Function()? trigger,
   }) async {
-    final matched = Completer<bool>();
+    final matched = Completer<String?>();
     final chunks = StringBuffer();
+    final carry = marker.length - 1;
+    var window = '';
 
     final sub = textStream.listen((chunk) {
       if (matched.isCompleted) return;
       chunks.write(chunk);
-      if (test(chunks.toString())) {
-        matched.complete(true);
+      window = window + chunk;
+      if (window.contains(marker)) {
+        matched.complete(chunks.toString());
+        return;
+      }
+      if (window.length > carry) {
+        window = window.substring(window.length - carry);
       }
     });
     final timer = Timer(timeout, () {
-      if (!matched.isCompleted) matched.complete(false);
+      if (!matched.isCompleted) matched.complete(null);
     });
 
     if (trigger != null) {
@@ -1314,7 +1457,33 @@ class FlipperClient {
     _emitDevices();
   }
 
-  void _emitDevices() {
+  // Throttled: at most one event per window, plus a trailing event so the
+  // final state always reaches listeners. `immediate` flushes right away
+  // (scan finished, explicit refresh).
+  void _emitDevices({bool immediate = false}) {
+    if (immediate) {
+      _devicesEmitTimer?.cancel();
+      _devicesEmitTimer = null;
+      _devicesEmitDirty = false;
+      _emitDevicesNow();
+      return;
+    }
+    if (_devicesEmitTimer != null) {
+      _devicesEmitDirty = true;
+      return;
+    }
+    _emitDevicesNow();
+    _devicesEmitTimer = Timer(_devicesEmitWindow, () {
+      _devicesEmitTimer = null;
+      if (_devicesEmitDirty) {
+        _devicesEmitDirty = false;
+        _emitDevices();
+      }
+    });
+  }
+
+  void _emitDevicesNow() {
+    if (_devicesCtrl.isClosed) return;
     final list = _devices.values.toList()
       ..sort((a, b) {
         final byLink = a.link.index.compareTo(b.link.index);
@@ -1335,6 +1504,8 @@ class FlipperClient {
   Future<void> dispose() async {
     await disconnect();
     await stopScan();
+    _devicesEmitTimer?.cancel();
+    _devicesEmitTimer = null;
     await _devicesCtrl.close();
     await _connectionCtrl.close();
     await _modeCtrl.close();
@@ -1368,15 +1539,25 @@ class FlipperClient {
 
   // Device info is fetched on demand (awaitName / awaitDeviceInfo), through
   // the normal request queue, at most once per session. The library starts no
-  // RPC traffic on its own at connect time.
-  void _ensureDeviceInfoFetch() {
-    if (_deviceInfoFetched || _deviceInfoFetch != null) return;
-    if (_transport == null) return;
+  // RPC traffic on its own at connect time. The returned future errors when
+  // the fetch fails (no transport, RPC error, link drop) so callers fail fast
+  // instead of waiting for a snapshot that will never arrive; a later call
+  // starts a fresh attempt.
+  Future<void> _ensureDeviceInfoFetch() {
+    final existing = _deviceInfoFetch;
+    if (existing != null) return existing;
+    if (_deviceInfoFetched) return Future.value();
+    if (_transport == null) {
+      return Future.error(
+        StateError('Cannot fetch device info: no active transport'),
+      );
+    }
     late final Future<void> fetch;
     fetch = _fetchDeviceInfoOnce().whenComplete(() {
       if (identical(_deviceInfoFetch, fetch)) _deviceInfoFetch = null;
     });
     _deviceInfoFetch = fetch;
+    return fetch;
   }
 
   Future<void> _fetchDeviceInfoOnce() async {
@@ -1387,9 +1568,11 @@ class FlipperClient {
       await deviceInfo(priority: FlipperRequestPriority.foreground);
     } catch (error) {
       LogService.log('[FlipperClient] device info fetch failed: $error');
-      return;
+      rethrow;
     }
-    if (!identical(_connectedDevice, device)) return;
+    if (!identical(_connectedDevice, device)) {
+      throw StateError('Device info fetch outlived its session');
+    }
     _deviceInfoFetched = true;
     final snapshot = deviceInfoCache;
     if (!_deviceInfoWatchCtrl.isClosed) {

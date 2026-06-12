@@ -70,6 +70,12 @@ void desktopUsbIsolateEntry(DesktopUsbIsolateConfig config) {
       ..stopBits = 1
       ..parity = SerialPortParity.none;
     cfg.setFlowControl(SerialPortFlowControl.none);
+    // Windows' usbser.sys does not assert DTR/RTS on open and the Flipper
+    // firmware gates its CLI on DTR — without this, writes complete but the
+    // device never answers. Harmless on macOS/Linux. Set after
+    // setFlowControl, which resets both lines.
+    cfg.dtr = SerialPortDtr.on;
+    cfg.rts = SerialPortRts.on;
     port.config = cfg;
   } catch (e) {
     final error = SerialPort.lastError?.message;
@@ -81,6 +87,11 @@ void desktopUsbIsolateEntry(DesktopUsbIsolateConfig config) {
   }
 
   var shuttingDown = false;
+  // Read-loop pacing: fast 5 ms reads while traffic flows (low latency),
+  // backing off to 50 ms after ~64 consecutive empty reads so an idle open
+  // port does not spin at ~200 syscalls/s burning CPU and battery. Any write
+  // resets to fast mode so the response is picked up promptly.
+  var idleReads = 0;
 
   void shutdown() {
     if (shuttingDown) return;
@@ -100,6 +111,7 @@ void desktopUsbIsolateEntry(DesktopUsbIsolateConfig config) {
   commandPort.listen((message) {
     if (shuttingDown) return;
     if (message is DesktopUsbWriteRequest) {
+      idleReads = 0;
       try {
         var offset = 0;
         while (offset < message.bytes.length) {
@@ -138,16 +150,21 @@ void desktopUsbIsolateEntry(DesktopUsbIsolateConfig config) {
     }
   });
 
-  // Blocking read loop: port.read(timeout: 5) returns as soon as data arrives
-  // (up to 5 ms wait), so response latency is much lower than timer polling.
+  // Blocking read loop: port.read returns as soon as data arrives (up to the
+  // timeout), so response latency is much lower than timer polling.
   // await Future.delayed(Duration.zero) yields to the event loop between reads
-  // so commandPort write requests can be processed without long delays.
+  // so commandPort write requests can be processed without long delays (a
+  // write also drops the loop back to fast pacing, see idleReads above).
   Timer(Duration.zero, () async {
     while (!shuttingDown) {
       try {
-        final bytes = port.read(65536, timeout: 5);
+        final fast = idleReads < 64;
+        final bytes = port.read(65536, timeout: fast ? 5 : 50);
         if (bytes.isNotEmpty) {
+          idleReads = 0;
           config.eventPort.send(DesktopUsbBytes(Uint8List.fromList(bytes)));
+        } else {
+          idleReads++;
         }
       } catch (e) {
         if (!port.isOpen) {

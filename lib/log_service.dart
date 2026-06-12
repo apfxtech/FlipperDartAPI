@@ -4,6 +4,11 @@ import 'package:logging/logging.dart' as logging;
 import 'package:universal_ble/universal_ble.dart';
 
 class LogService {
+  // Compile-time logging switch. Hot paths (per-chunk RX, per-frame routing,
+  // per-write BLE) must guard with `if (LogService.enabled)` so release builds
+  // skip building the interpolated message strings entirely.
+  static const bool enabled = kDebugMode;
+
   static bool _initialized = false;
 
   static Future<void> initialize() async {

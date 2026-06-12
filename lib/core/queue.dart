@@ -54,11 +54,17 @@ class _PendingRpc {
   Timer? _timeoutTimer;
   Duration? _watchdogTimeout;
   void Function()? _watchdogCallback;
+  int _frameCount = 0;
 
   // True once at least one frame of this command reached the transport. A
   // started command has state on the firmware side and cannot survive a link
   // drop; a never-started one replays safely on the next session.
   bool started = false;
+
+  // When false, response frames are delivered through [onFrame] only and the
+  // completed future carries an empty list — large transfers (storage reads)
+  // would otherwise hold every protobuf frame in memory until completion.
+  bool retainFrames = true;
 
   _PendingRpc(this.commandId) {
     // Multi-frame requests may fail while their body is still being sent,
@@ -75,13 +81,26 @@ class _PendingRpc {
   // so the TX worker can wait for the response without try/catch.
   Future<void> get settled => _settled.future;
 
+  int get frameCount => _frameCount;
+
   void add(Main frame) {
-    frames.add(frame);
-    onFrame?.call(frame);
+    _frameCount++;
+    if (retainFrames) frames.add(frame);
+    // A throwing user callback (e.g. a progress handler) must not abort RX
+    // processing: the remaining frames of this chunk still have to be routed.
+    try {
+      onFrame?.call(frame);
+    } catch (error) {
+      LogService.log(
+        '[RPC] onFrame callback threw for cmdId=$commandId: $error',
+      );
+    }
   }
 
+  // Arms (or re-arms with a new duration) the response watchdog. Callers mark
+  // [started] separately, once the first frame actually reached the transport:
+  // the watchdog also has to cover requests stuck in the queue before TX.
   void armTimeout(Duration timeout, void Function() onTimeout) {
-    started = true;
     _watchdogTimeout = timeout;
     _watchdogCallback = onTimeout;
     _scheduleTimer();

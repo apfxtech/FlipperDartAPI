@@ -40,29 +40,27 @@ extension FlipperStorageApi on FlipperClient {
     Duration timeout = const Duration(minutes: 5),
     FlipperRequestPriority priority = FlipperRequestPriority.foreground,
   }) async {
-    var received = 0;
-    final batch = await callRpc(
+    // Data is collected per frame into a byte builder and the frames are not
+    // retained: holding every protobuf frame plus a growable List<int> copy
+    // multiplied a large file's footprint by an order of magnitude.
+    final bytes = BytesBuilder(copy: true);
+    await callRpcFrames(
       Main(storageReadRequest: ReadRequest(path: path)),
-      (frame) =>
-          frame.hasStorageReadResponse() ? frame.storageReadResponse : null,
       timeout: timeout,
       priority: priority,
+      retainFrames: false,
       onFrame: (frame) {
         if (!frame.hasStorageReadResponse()) return;
         final resp = frame.storageReadResponse;
         if (!resp.hasFile()) return;
-        received += resp.file.data.length;
+        bytes.add(resp.file.data);
         if (expectedSize > 0) {
-          onProgress?.call((received / expectedSize).clamp(0.0, 1.0));
+          onProgress?.call((bytes.length / expectedSize).clamp(0.0, 1.0));
         }
       },
     );
-    final bytes = <int>[];
-    for (final r in batch.items) {
-      if (r.hasFile()) bytes.addAll(r.file.data);
-    }
     onProgress?.call(1.0);
-    return bytes;
+    return bytes.takeBytes();
   }
 
   Future<List<Main>> storageWrite(
@@ -211,9 +209,11 @@ extension FlipperStorageApi on FlipperClient {
                 : '$dir/${entry.name}';
             queue.add(sub);
           } else {
-            LogService.log(
-              '[StorageDu] file "$dir/${entry.name}" size=${entry.size}',
-            );
+            if (LogService.enabled) {
+              LogService.log(
+                '[StorageDu] file "$dir/${entry.name}" size=${entry.size}',
+              );
+            }
             total += entry.size;
           }
         }
@@ -342,7 +342,7 @@ extension FlipperStorageApi on FlipperClient {
     }
 
     if (cancelled) {
-      await _deleteCancelledWrite(path);
+      await _deletePartialWrite(path);
       throw FlipperWriteCancelledException(path);
     }
 
@@ -350,16 +350,16 @@ extension FlipperStorageApi on FlipperClient {
     LogService.log('[Storage] write "$path" complete');
   }
 
-  // Best-effort cleanup of a cancelled upload's partial file.
-  Future<void> _deleteCancelledWrite(String path) async {
+  // Best-effort cleanup of an interrupted upload's partial file.
+  Future<void> _deletePartialWrite(String path) async {
     try {
       await storageDelete(
         DeleteRequest(path: path),
         priority: FlipperRequestPriority.rightNow,
       );
-      LogService.log('[Storage] partial file "$path" deleted after cancel');
+      LogService.log('[Storage] partial file "$path" deleted');
     } catch (e) {
-      LogService.log('[Storage] cleanup of cancelled write "$path" failed: $e');
+      LogService.log('[Storage] cleanup of partial write "$path" failed: $e');
     }
   }
 
@@ -377,24 +377,43 @@ extension FlipperStorageApi on FlipperClient {
     bool Function()? isCancelled,
   }) async {
     final tempPath = '$path.tmp';
-    await storageWriteChunked(
-      tempPath,
-      data,
-      onProgress: onProgress,
-      timeout: timeout,
-      priority: priority,
-      isCancelled: isCancelled,
-    );
+    try {
+      await storageWriteChunked(
+        tempPath,
+        data,
+        onProgress: onProgress,
+        timeout: timeout,
+        priority: priority,
+        isCancelled: isCancelled,
+      );
+    } catch (e) {
+      // Cancelled uploads clean up after themselves inside storageWriteChunked;
+      // other failures may leave a partial temp file behind — remove it while
+      // the session is still alive so it does not accumulate on the SD card.
+      if (e is! FlipperWriteCancelledException && isConnected) {
+        unawaited(_deletePartialWrite(tempPath));
+      }
+      rethrow;
+    }
 
     try {
       await storageDelete(DeleteRequest(path: path), priority: priority);
     } on FlipperRpcStorageNotExistException {
       // First write to this path: nothing to replace.
     }
-    await storageRename(
-      RenameRequest(oldPath: tempPath, newPath: path),
-      priority: priority,
-    );
+    try {
+      await storageRename(
+        RenameRequest(oldPath: tempPath, newPath: path),
+        priority: priority,
+      );
+    } catch (e) {
+      // The original may already be deleted at this point; the uploaded data
+      // is intact at tempPath — say so instead of reporting a bare failure.
+      throw StateError(
+        'Replacing "$path" failed after upload; '
+        'the uploaded data is at "$tempPath": $e',
+      );
+    }
     LogService.log('[Storage] safe write "$path" complete');
   }
 
