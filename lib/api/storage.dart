@@ -238,12 +238,19 @@ extension FlipperStorageApi on FlipperClient {
     );
   }
 
+  /// Streams [data] to [path]. The firmware opens the target with
+  /// CREATE_ALWAYS, so an existing file is truncated by the first frame —
+  /// deleting it beforehand is pointless. [isCancelled] is checked before
+  /// every chunk; on cancellation the firmware's write stream is closed
+  /// cleanly with an empty final frame, the partial file is deleted (best
+  /// effort) and [FlipperWriteCancelledException] is thrown.
   Future<void> storageWriteChunked(
     String path,
     List<int> data, {
     void Function(double progress)? onProgress,
     Duration timeout = const Duration(seconds: 300),
     FlipperRequestPriority priority = FlipperRequestPriority.foreground,
+    bool Function()? isCancelled,
   }) async {
     final total = data.length;
     final rpcChunkSize =
@@ -257,12 +264,30 @@ extension FlipperStorageApi on FlipperClient {
       'rpcChunk=$rpcChunkSize',
     );
 
-    Future<void> upload() {
-      return callRpcFramesMulti(
+    // Returns true when the upload was cancelled mid-stream (the firmware
+    // still received a valid final frame and replied with its ACK).
+    Future<bool> upload() async {
+      var cancelled = false;
+      await callRpcFramesMulti(
         (sendFrame) async {
           var offset = 0;
           var frameIndex = 0;
           while (true) {
+            if (isCancelled?.call() ?? false) {
+              cancelled = true;
+              // Close the firmware's write stream: without a hasNext=false
+              // frame its storage handler would stay in the writing state
+              // until an unrelated command resets it.
+              final req = WriteRequest()
+                ..path = path
+                ..ensureFile().data = const <int>[];
+              await sendFrame(Main(hasNext: false, storageWriteRequest: req));
+              LogService.log(
+                '[Storage] write "$path" cancelled after $frameIndex frames',
+              );
+              return;
+            }
+
             final end = (offset + rpcChunkSize) > total
                 ? total
                 : (offset + rpcChunkSize);
@@ -286,12 +311,19 @@ extension FlipperStorageApi on FlipperClient {
         },
         timeout: timeout,
         priority: priority,
-      ).then((_) {});
+      );
+      return cancelled;
     }
 
+    bool cancelled;
     try {
-      await upload();
+      cancelled = await upload();
     } catch (e) {
+      if (isCancelled?.call() ?? false) {
+        // The link died while the caller was cancelling anyway; the firmware
+        // session (and its partial file state) died with it.
+        throw FlipperWriteCancelledException(path);
+      }
       if (!_isLinkDropError(e)) {
         LogService.log('[Storage] write "$path" failed: $e');
         rethrow;
@@ -306,11 +338,64 @@ extension FlipperStorageApi on FlipperClient {
         rethrow;
       }
       LogService.log('[Storage] link restored, restarting write "$path"');
-      await upload();
+      cancelled = await upload();
+    }
+
+    if (cancelled) {
+      await _deleteCancelledWrite(path);
+      throw FlipperWriteCancelledException(path);
     }
 
     onProgress?.call(1.0);
     LogService.log('[Storage] write "$path" complete');
+  }
+
+  // Best-effort cleanup of a cancelled upload's partial file.
+  Future<void> _deleteCancelledWrite(String path) async {
+    try {
+      await storageDelete(
+        DeleteRequest(path: path),
+        priority: FlipperRequestPriority.rightNow,
+      );
+      LogService.log('[Storage] partial file "$path" deleted after cancel');
+    } catch (e) {
+      LogService.log('[Storage] cleanup of cancelled write "$path" failed: $e');
+    }
+  }
+
+  /// Safe replace: uploads to a temporary sibling first, then swaps it into
+  /// [path], so the original file survives an interrupted or cancelled
+  /// transfer. The destructive window shrinks from the whole upload to the
+  /// delete+rename pair at the end. FatFS cannot rename onto an existing
+  /// name, hence the explicit delete of the original before the rename.
+  Future<void> storageWriteChunkedSafe(
+    String path,
+    List<int> data, {
+    void Function(double progress)? onProgress,
+    Duration timeout = const Duration(seconds: 300),
+    FlipperRequestPriority priority = FlipperRequestPriority.foreground,
+    bool Function()? isCancelled,
+  }) async {
+    final tempPath = '$path.tmp';
+    await storageWriteChunked(
+      tempPath,
+      data,
+      onProgress: onProgress,
+      timeout: timeout,
+      priority: priority,
+      isCancelled: isCancelled,
+    );
+
+    try {
+      await storageDelete(DeleteRequest(path: path), priority: priority);
+    } on FlipperRpcStorageNotExistException {
+      // First write to this path: nothing to replace.
+    }
+    await storageRename(
+      RenameRequest(oldPath: tempPath, newPath: path),
+      priority: priority,
+    );
+    LogService.log('[Storage] safe write "$path" complete');
   }
 
   Future<List<Main>> storageTarExtract(

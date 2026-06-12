@@ -361,25 +361,39 @@ class FlipperClient {
     return false;
   }
 
-  // Waits until the client is back in RPC mode (e.g. after an automatic
-  // reconnect), up to [timeout]. A timeout is a result, not an exception.
+  // Waits until the client is back in RPC mode over a live transport (e.g.
+  // after an automatic reconnect), up to [timeout]. The transport check
+  // matters: right after a fault the mode still reads `rpc` for a moment while
+  // the recovery operation is queued, and trusting it would burn a retry on
+  // the dead session. A timeout is a result, not an exception.
   Future<bool> _waitForRpcSession(Duration timeout) async {
-    if (_mode == FlipperMode.rpc) return true;
+    bool healthy() =>
+        _mode == FlipperMode.rpc && (_transport?.isActive ?? false);
+
+    if (healthy()) return true;
     final restored = Completer<bool>();
     final timer = Timer(timeout, () {
       if (!restored.isCompleted) restored.complete(false);
     });
-    final sub = modeStream.listen((mode) {
-      if (mode == FlipperMode.rpc && !restored.isCompleted) {
+    final modeSub = modeStream.listen((mode) {
+      if (mode == FlipperMode.rpc && healthy() && !restored.isCompleted) {
         restored.complete(true);
       }
     });
-    if (_mode == FlipperMode.rpc && !restored.isCompleted) {
+    // A terminal disconnect (no reconnect in progress) ends the wait early
+    // instead of burning the whole timeout.
+    final connSub = connectionStream.listen((state) {
+      if (!state.connected && !state.reconnecting && !restored.isCompleted) {
+        restored.complete(false);
+      }
+    });
+    if (healthy() && !restored.isCompleted) {
       restored.complete(true);
     }
     final result = await restored.future;
     timer.cancel();
-    await sub.cancel();
+    await modeSub.cancel();
+    await connSub.cancel();
     return result;
   }
 

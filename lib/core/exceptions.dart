@@ -4,6 +4,18 @@ class FlipperUnsupportedModeError extends StateError {
   FlipperUnsupportedModeError(super.message);
 }
 
+/// Thrown by storageWriteChunked when the caller cancels the upload. The
+/// firmware's write stream has been closed cleanly with an empty final frame
+/// and the partial file deleted (best effort).
+class FlipperWriteCancelledException implements Exception {
+  final String path;
+
+  FlipperWriteCancelledException(this.path);
+
+  @override
+  String toString() => 'Write cancelled: $path';
+}
+
 class FlipperRpcException implements Exception {
   final CommandStatus status;
   final int statusValue;
