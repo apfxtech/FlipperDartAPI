@@ -9,19 +9,36 @@ class FlipperTransportError implements Exception {
   String toString() => message;
 }
 
+enum _TransportLifecycle { active, closing, closed }
+
+/// Base class for byte transports (BLE / USB serial).
+///
+/// Lifecycle contract:
+///  * [open] is called exactly once after construction.
+///  * Outbound data goes through [write]; the base class serializes writes so
+///    [rawWrite] never runs concurrently.
+///  * A transport that dies unexpectedly calls [onTransportFault] once with
+///    the reason: pending writes fail, [bytesStream] closes *without* an error
+///    event, and [closeReason] keeps the diagnosis for the client to report.
+///  * [close] is the orderly shutdown initiated by the client; it never
+///    throws.
 abstract class _Transport {
   final _bytesCtrl = StreamController<List<int>>.broadcast();
   final List<_TransportPendingWrite> _writeQueue = [];
   bool _writePumpRunning = false;
-  bool _closed = false;
-  bool _closing = false;
+  _TransportLifecycle _lifecycle = _TransportLifecycle.active;
+  Object? _closeReason;
 
   Stream<List<int>> get bytesStream => _bytesCtrl.stream;
 
-  bool get isClosed => _closed;
+  bool get isClosed => _lifecycle == _TransportLifecycle.closed;
+
+  bool get isActive => _lifecycle == _TransportLifecycle.active;
+
+  Object? get closeReason => _closeReason;
 
   void addBytes(List<int> bytes) {
-    if (_closed || _bytesCtrl.isClosed) return;
+    if (!isActive || _bytesCtrl.isClosed) return;
     _bytesCtrl.add(bytes);
   }
 
@@ -34,13 +51,13 @@ abstract class _Transport {
   Future<void> open();
 
   Future<void> write(Uint8List bytes) {
-    if (_closed || _closing) {
+    if (!isActive) {
       return Future.error(StateError('Transport closed'));
     }
-    final completer = Completer<void>();
-    _writeQueue.add(_TransportPendingWrite(bytes, completer));
+    final pending = _TransportPendingWrite(bytes);
+    _writeQueue.add(pending);
     _startWritePump();
-    return completer.future;
+    return pending.future;
   }
 
   void _startWritePump() {
@@ -50,32 +67,23 @@ abstract class _Transport {
   }
 
   Future<void> _runWritePump() async {
-    try {
-      while (_writeQueue.isNotEmpty && !_closed) {
-        final pending = _writeQueue.removeAt(0);
-        if (_closed || _closing) {
-          if (!pending.completer.isCompleted) {
-            pending.completer.completeError(StateError('Transport closed'));
-          }
-          continue;
-        }
-        try {
-          await rawWrite(pending.bytes);
-          if (!pending.completer.isCompleted) pending.completer.complete();
-        } catch (error) {
-          if (!pending.completer.isCompleted) {
-            pending.completer.completeError(error);
-          }
-        }
+    while (_writeQueue.isNotEmpty) {
+      final pending = _writeQueue.removeAt(0);
+      if (!isActive) {
+        pending.fail(StateError('Transport closed'));
+        continue;
       }
-    } finally {
-      _writePumpRunning = false;
+      try {
+        await rawWrite(pending.bytes);
+        pending.complete();
+      } catch (error) {
+        pending.fail(error);
+      }
     }
+    _writePumpRunning = false;
   }
 
   Future<void> rawWrite(Uint8List bytes);
-
-  Future<void> restartRpc() async {}
 
   Future<void> writeAscii(String text) =>
       write(Uint8List.fromList(ascii.encode(text)));
@@ -84,40 +92,38 @@ abstract class _Transport {
 
   void _failPendingWrites(Object error) {
     while (_writeQueue.isNotEmpty) {
-      final pending = _writeQueue.removeAt(0);
-      if (!pending.completer.isCompleted) {
-        pending.completer.completeError(error);
-      }
+      _writeQueue.removeAt(0).fail(error);
     }
   }
 
-  void onTransportFault(Object error) {
-    if (_closed) return;
-    _closed = true;
-    LogService.log('[Transport] fault: $error');
-    _failPendingWrites(error);
-    onFaultExtra(error);
+  /// Marks the transport dead after an unexpected failure. Idempotent; safe to
+  /// call from platform callbacks. Never throws.
+  void onTransportFault(Object reason) {
+    if (_lifecycle == _TransportLifecycle.closed) return;
+    _lifecycle = _TransportLifecycle.closed;
+    _closeReason = reason;
+    LogService.log('[Transport] fault: $reason');
+    _failPendingWrites(reason);
+    onFaultExtra(reason);
     if (!_bytesCtrl.isClosed) {
       _bytesCtrl.close();
     }
   }
 
+  /// Subclass hook to release platform resources and wake internal waiters
+  /// after a fault. Must not throw.
   void onFaultExtra(Object error) {}
 
   Future<void> close() async {
-    if (_closed) {
-      _failPendingWrites(StateError('Transport closed'));
-      return;
-    }
-    _closing = true;
+    if (_lifecycle != _TransportLifecycle.active) return;
+    _lifecycle = _TransportLifecycle.closing;
     _failPendingWrites(StateError('Transport closed'));
     try {
       await doClose();
     } catch (e) {
       LogService.log('[Transport] doClose error: $e');
     }
-    _closed = true;
-    _closing = false;
+    _lifecycle = _TransportLifecycle.closed;
     if (!_bytesCtrl.isClosed) {
       await _bytesCtrl.close();
     }

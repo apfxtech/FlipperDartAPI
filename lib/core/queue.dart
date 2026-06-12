@@ -1,5 +1,9 @@
 part of '../flipper_client.dart';
 
+/// One outbound RPC frame waiting for its turn on the transport.
+///
+/// Settles exactly once: [markSent] when the frame was handed to the
+/// transport, or [fail] when it never made it out.
 class _QueuedRequest implements Comparable<_QueuedRequest> {
   final Main frame;
   final FlipperRequestPriority priority;
@@ -28,8 +32,6 @@ class _QueuedRequest implements Comparable<_QueuedRequest> {
     onError?.call(error);
   }
 
-  void cancelTimeout() {}
-
   @override
   int compareTo(_QueuedRequest other) {
     final byPriority = priority.index.compareTo(other.priority.index);
@@ -38,11 +40,16 @@ class _QueuedRequest implements Comparable<_QueuedRequest> {
   }
 }
 
+/// In-flight RPC call: collects response frames and owns the response
+/// watchdog timer. Completes exactly once.
 class _PendingRpc {
   final int commandId;
   final List<Main> frames = [];
   final Completer<List<Main>> _completer = Completer<List<Main>>();
+  final Completer<void> _settled = Completer<void>();
   Timer? _timeoutTimer;
+  Duration? _watchdogTimeout;
+  void Function()? _watchdogCallback;
 
   _PendingRpc(this.commandId);
 
@@ -50,13 +57,16 @@ class _PendingRpc {
 
   Future<List<Main>> get future => _completer.future;
 
+  /// Resolves when the call settles — success or failure — and never errors.
+  /// Lets the TX worker wait for the response without try/catch.
+  Future<void> get settled => _settled.future;
+
+  bool get isDone => _completer.isCompleted;
+
   void add(Main frame) {
     frames.add(frame);
     onFrame?.call(frame);
   }
-
-  Duration? _watchdogTimeout;
-  void Function()? _watchdogCallback;
 
   void armTimeout(Duration timeout, void Function() onTimeout) {
     _watchdogTimeout = timeout;
@@ -89,22 +99,33 @@ class _PendingRpc {
 
   void complete() {
     cancelTimeout();
-    if (!_completer.isCompleted) {
-      _completer.complete(List.unmodifiable(frames));
-    }
+    if (_completer.isCompleted) return;
+    _completer.complete(List.unmodifiable(frames));
+    _settled.complete();
   }
 
   void completeError(Object error) {
     cancelTimeout();
-    if (!_completer.isCompleted) {
-      _completer.completeError(error);
-    }
+    if (_completer.isCompleted) return;
+    _completer.completeError(error);
+    _settled.complete();
   }
 }
 
+/// One buffered transport write. Settles exactly once.
 class _TransportPendingWrite {
   final Uint8List bytes;
-  final Completer<void> completer;
+  final Completer<void> _completer = Completer<void>();
 
-  _TransportPendingWrite(this.bytes, this.completer);
+  _TransportPendingWrite(this.bytes);
+
+  Future<void> get future => _completer.future;
+
+  void complete() {
+    if (!_completer.isCompleted) _completer.complete();
+  }
+
+  void fail(Object error) {
+    if (!_completer.isCompleted) _completer.completeError(error);
+  }
 }

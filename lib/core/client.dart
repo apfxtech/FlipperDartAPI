@@ -7,6 +7,10 @@ class FlipperClient {
   static const String cliPrompt = '\r\n\r\n>: ';
   static const String startRpcSession = 'start_rpc_session\r';
 
+  // How many consecutive RX parse failures we tolerate before declaring the
+  // RPC byte stream desynchronized and ending the session.
+  static const int _maxRxParseErrorStreak = 3;
+
   final _devicesCtrl = StreamController<List<FlipperDevice>>.broadcast();
   final _connectionCtrl = StreamController<FlipperConnectionState>.broadcast();
   final _modeCtrl = StreamController<FlipperMode>.broadcast();
@@ -17,10 +21,8 @@ class FlipperClient {
   final _errorCtrl = StreamController<FlipperRpcException>.broadcast();
   final _deviceInfoCompleteCtrl =
       StreamController<Map<String, String>>.broadcast();
-  bool _deviceInfoFetched = false;
-
-  final _deviceInfoWatchCtrl = StreamController<Map<String, String>>.broadcast();
-  int _collectionGen = 0;
+  final _deviceInfoWatchCtrl =
+      StreamController<Map<String, String>>.broadcast();
 
   final Map<String, FlipperDevice> _devices = {};
   final Map<int, _PendingRpc> _pendingRpc = {};
@@ -29,20 +31,33 @@ class FlipperClient {
   final _frameBuffer = _FrameBuffer();
   final _utf8Decoder = const Utf8Decoder(allowMalformed: true);
 
-  Completer<void>? _queueSignal;
-  bool _workerRunning = false;
-  int _requestSeq = 0;
-  int? _activeMultiFrameGroup;
-
-  StreamSubscription<List<int>>? _transportSub;
+  // ── Session state ──────────────────────────────────────────────────────────
+  // _sessionGen increments on every connect / teardown. Every long-lived async
+  // task (TX worker, RPC switch, auto device info) captures the generation it
+  // was started for and bails out when it no longer matches, so a stale task
+  // can never touch the state of a newer session.
+  int _sessionGen = 0;
   _Transport? _transport;
+  StreamSubscription<List<int>>? _transportSub;
   FlipperDevice? _connectedDevice;
   FlipperMode _mode = FlipperMode.disconnected;
+  Future<void>? _switchToRpcFuture;
+  bool cliExclusive = false;
+  bool _deviceInfoFetched = false;
+  int _collectionGen = 0;
+  int _rxParseErrorStreak = 0;
+
+  // ── TX worker state ────────────────────────────────────────────────────────
+  Completer<void>? _queueSignal;
+  int? _workerGen;
+  int _requestSeq = 0;
+  // While a multi-frame request group is being transmitted, only frames of
+  // that commandId may leave the queue; everything else waits.
+  int? _txGroupCommandId;
+
   int _nextCommandId = 1;
   bool _scanning = false;
   Completer<void>? _scanPhaseInterrupt;
-  bool cliExclusive = false;
-  Future<void>? _switchToRpcFuture;
 
   Stream<List<FlipperDevice>> get devicesStream => _devicesCtrl.stream;
 
@@ -123,6 +138,8 @@ class FlipperClient {
     await _blePlatform.requestPermissions();
   }
 
+  // ── Discovery ──────────────────────────────────────────────────────────────
+
   Future<List<FlipperDevice>> refreshDevices({
     Duration bleTimeout = const Duration(seconds: 10),
   }) async {
@@ -197,6 +214,8 @@ class FlipperClient {
     if (interrupt != null && !interrupt.isCompleted) interrupt.complete();
   }
 
+  // ── Connection lifecycle ───────────────────────────────────────────────────
+
   Future<FlipperDevice> connectById(String id, {FlipperLink? link}) async {
     FlipperDevice? device;
     for (final candidate in devices) {
@@ -218,91 +237,107 @@ class FlipperClient {
     // connection events, which otherwise halves effective BLE throughput.
     await stopScan();
 
+    final gen = ++_sessionGen;
+    LogService.log(
+      '[FlipperClient] connecting to ${device.name} '
+      '(${device.link.name}:${device.id})',
+    );
     _Transport? transport;
     try {
       transport = await _openTransport(device);
-      _transport = transport;
-      _connectedDevice = device;
-      _transportSub = transport.bytesStream.listen(
-        _onTransportBytes,
-        onError: _onTransportError,
-        onDone: _onTransportDone,
-      );
-
       await transport.open();
-      _setMode(transport.initialMode);
-      _startWorker();
-      if (transport.supportsCli) {
-        unawaited(switchToRpcMode());
-      }
-      return device;
     } catch (error) {
       LogService.log(
         '[FlipperClient] connect failed '
         'device=${device.name} link=${device.link.name}: $error',
       );
-      await _cleanupFailedConnect(transport);
+      await transport?.close();
       rethrow;
     }
-  }
 
-  Future<void> _cleanupFailedConnect(_Transport? transport) async {
-    _transport = null;
-    _connectedDevice = null;
-    _deviceInfoCache.clear();
-    _deviceInfoFetched = false;
-    _frameBuffer.clear();
-
-    await _transportSub?.cancel();
-    _transportSub = null;
-
-    _failAllPending(StateError('Disconnected'));
-
-    if (transport != null) {
-      try {
-        await transport.close();
-      } catch (_) {}
+    if (gen != _sessionGen) {
+      // A concurrent connect()/disconnect() superseded this attempt while the
+      // transport was opening; hand the link back instead of hijacking state.
+      await transport.close();
+      throw StateError('Connection attempt superseded');
     }
 
-    _setMode(FlipperMode.disconnected);
+    _transport = transport;
+    _connectedDevice = device;
+    _transportSub = transport.bytesStream.listen(
+      _onTransportBytes,
+      onError: (Object error, StackTrace stackTrace) {
+        // Transports report failures via onTransportFault and never put error
+        // events on bytesStream; this is defensive so a misbehaving backend
+        // ends the session instead of crashing an unhandled-error zone.
+        LogService.log('[FlipperClient] transport stream error: $error');
+        unawaited(_teardown(reason: error));
+      },
+      onDone: () => _onTransportClosed(transport!),
+    );
+
+    _setMode(transport.initialMode);
+    _startWorker(gen);
+    if (transport.supportsCli) {
+      unawaited(
+        switchToRpcMode().catchError((Object error) {
+          LogService.log('[FlipperClient] automatic RPC switch failed: $error');
+        }),
+      );
+    }
+    return device;
   }
 
-  Future<void> disconnect() async {
+  Future<void> disconnect() => _teardown(reason: 'disconnect requested');
+
+  /// Single teardown path for every way a session can end: explicit
+  /// disconnect, transport fault, failed connect, or RPC desync. Synchronously
+  /// detaches all session state before the first await so concurrent callers
+  /// and late transport callbacks see a consistent "disconnected" picture.
+  Future<void> _teardown({required Object reason}) async {
+    _sessionGen++;
+
     final transport = _transport;
+    final sub = _transportSub;
     _transport = null;
+    _transportSub = null;
+    _connectedDevice = null;
     _switchToRpcFuture = null;
     _deviceInfoCache.clear();
     _deviceInfoFetched = false;
     _frameBuffer.clear();
+    _rxParseErrorStreak = 0;
 
-    await _transportSub?.cancel();
-    _transportSub = null;
-
-    _failAllPending(StateError('Disconnected'));
-
-    if (transport != null) {
-      try {
-        await transport.close();
-      } catch (_) {}
-    }
-
-    _connectedDevice = null;
-    _setMode(FlipperMode.disconnected);
+    _failAllRequests(StateError('Disconnected'));
+    _setMode(FlipperMode.disconnected, closeReason: reason);
     _signalWorker();
+
+    if (sub != null) await sub.cancel();
+    if (transport != null) await transport.close();
   }
 
-  void _failAllPending(Object error) {
-    _activeMultiFrameGroup = null;
-    for (final queued in _requestQueue) {
-      queued.fail(error);
-    }
-    _requestQueue.clear();
-    for (final pending in _pendingRpc.values) {
-      pending.cancelTimeout();
-      pending.completeError(error);
-    }
-    _pendingRpc.clear();
+  void _onTransportClosed(_Transport transport) {
+    if (!identical(_transport, transport)) return;
+    final reason = transport.closeReason ?? 'transport closed';
+    LogService.log('[FlipperClient] transport closed: $reason');
+    unawaited(_teardown(reason: reason));
   }
+
+  void _failAllRequests(Object error) {
+    _txGroupCommandId = null;
+    final queued = List<_QueuedRequest>.from(_requestQueue);
+    _requestQueue.clear();
+    for (final request in queued) {
+      request.fail(error);
+    }
+    final pending = List<_PendingRpc>.from(_pendingRpc.values);
+    _pendingRpc.clear();
+    for (final p in pending) {
+      p.completeError(error);
+    }
+  }
+
+  // ── Mode switching ─────────────────────────────────────────────────────────
 
   Future<void> switchToRpcMode() {
     if (cliExclusive) {
@@ -320,7 +355,7 @@ class FlipperClient {
     final transport = _requireTransport();
     if (_mode == FlipperMode.rpc) return;
     if (!transport.supportsCli) {
-      if (_transport == transport) {
+      if (identical(_transport, transport)) {
         _setMode(FlipperMode.rpc);
         _signalWorker();
       }
@@ -328,36 +363,36 @@ class FlipperClient {
     }
 
     LogService.log('[RPC] waiting for CLI prompt...');
-    try {
-      await _ensureCliPrompt();
-      LogService.log('[RPC] CLI prompt detected');
-    } catch (e) {
-      LogService.log('[RPC] CLI prompt timeout ($e), continuing anyway');
-    }
+    final promptSeen = await _waitForTextMatch(
+      (text) => text.contains(FlipperClient.cliPrompt),
+      timeout: const Duration(seconds: 5),
+      trigger: transport.nudgeCli,
+    );
+    LogService.log(
+      promptSeen
+          ? '[RPC] CLI prompt detected'
+          : '[RPC] CLI prompt timeout, continuing anyway',
+    );
+    if (!identical(_transport, transport)) return;
 
     LogService.log('[RPC] sending start_rpc_session');
-    try {
-      await transport.writeAscii(FlipperClient.startRpcSession);
-      await _waitForText(
-        (text) => text.contains('start_rpc_session'),
-        timeout: const Duration(seconds: 2),
-      );
-      LogService.log(
-        '[RPC] start_rpc_session echoed, flushing serial buffer...',
-      );
-    } catch (e) {
-      LogService.log(
-        '[RPC] start_rpc_session echo timeout ($e), may already be in RPC mode',
-      );
-    }
+    final echoed = await _waitForTextMatch(
+      (text) => text.contains('start_rpc_session'),
+      timeout: const Duration(seconds: 2),
+      trigger: () => transport.writeAscii(FlipperClient.startRpcSession),
+    );
+    LogService.log(
+      echoed
+          ? '[RPC] start_rpc_session echoed, flushing serial buffer...'
+          : '[RPC] start_rpc_session echo timeout, may already be in RPC mode',
+    );
 
     await Future<void>.delayed(const Duration(milliseconds: 150));
+    if (!identical(_transport, transport)) return;
     _frameBuffer.clear();
     LogService.log('[RPC] mode switched to RPC');
-    if (_transport == transport) {
-      _setMode(FlipperMode.rpc);
-      _signalWorker();
-    }
+    _setMode(FlipperMode.rpc);
+    _signalWorker();
   }
 
   Future<void> enterRpcMode() => switchToRpcMode();
@@ -382,6 +417,8 @@ class FlipperClient {
 
   Future<void> enterCliMode() => switchToCliMode();
 
+  // ── CLI ────────────────────────────────────────────────────────────────────
+
   Future<String> executeCli(
     String command, {
     Duration timeout = const Duration(seconds: 5),
@@ -395,26 +432,24 @@ class FlipperClient {
       await switchToCliMode();
     }
     final transport = _requireTransport();
-    final chunks = <String>[];
-    final completer = Completer<String>();
-
-    late final StreamSubscription<String> sub;
-    sub = textStream.listen((chunk) {
-      chunks.add(chunk);
-      final full = chunks.join();
-      if (full.contains(FlipperClient.cliPrompt) && !completer.isCompleted) {
-        completer.complete(_trimCliResult(full, command));
-      }
-    });
-
-    try {
-      await transport.writeAscii('\r');
-      await Future<void>.delayed(const Duration(milliseconds: 80));
-      await transport.writeAscii('$command\r');
-      return await completer.future.timeout(timeout);
-    } finally {
-      await sub.cancel();
+    String result = '';
+    final matched = await _waitForTextMatch(
+      (text) {
+        if (!text.contains(FlipperClient.cliPrompt)) return false;
+        result = _trimCliResult(text, command);
+        return true;
+      },
+      timeout: timeout,
+      trigger: () async {
+        await transport.writeAscii('\r');
+        await Future<void>.delayed(const Duration(milliseconds: 80));
+        await transport.writeAscii('$command\r');
+      },
+    );
+    if (!matched) {
+      throw TimeoutException('CLI command timeout: $command');
     }
+    return result;
   }
 
   Future<void> writeCliText(String text) async {
@@ -458,6 +493,8 @@ class FlipperClient {
     return executeCli(command, timeout: timeout);
   }
 
+  // ── RPC calls ──────────────────────────────────────────────────────────────
+
   Future<void> sendRpc(
     Main message, {
     FlipperRequestPriority priority = FlipperRequestPriority.defaultPriority,
@@ -468,21 +505,21 @@ class FlipperClient {
     if (message.commandId == 0) {
       message.commandId = nextCommandId();
     }
-    final completer = Completer<void>();
+    final sent = Completer<void>();
     _enqueueRequest(
       _QueuedRequest(
         frame: message,
         priority: priority,
         seq: _requestSeq++,
         onSent: () {
-          if (!completer.isCompleted) completer.complete();
+          if (!sent.isCompleted) sent.complete();
         },
         onError: (error) {
-          if (!completer.isCompleted) completer.completeError(error);
+          if (!sent.isCompleted) sent.completeError(error);
         },
       ),
     );
-    await completer.future;
+    await sent.future;
   }
 
   Future<List<Main>> callRpcFrames(
@@ -501,44 +538,21 @@ class FlipperClient {
 
     final pending = _PendingRpc(commandId)..onFrame = onFrame;
     _pendingRpc[commandId] = pending;
-    void armTimeout() {
-      pending.armTimeout(timeout, () {
-        _pendingRpc.remove(commandId);
-        _removeQueuedCommand(commandId, 'RPC timeout before TX');
-        if (_activeMultiFrameGroup == commandId) {
-          _activeMultiFrameGroup = null;
-          _signalWorker();
-        }
-        pending.completeError(
-          TimeoutException(
-            'RPC timeout for commandId=$commandId '
-            'after ${timeout.inSeconds}s framesReceived=${pending.frames.length}',
-          ),
-        );
-      });
-    }
-
-    void failPending(Object error) {
-      _pendingRpc.remove(commandId);
-      if (_activeMultiFrameGroup == commandId) {
-        _activeMultiFrameGroup = null;
-        _signalWorker();
-      }
-      pending.cancelTimeout();
-      pending.completeError(error);
-    }
 
     _enqueueRequest(
       _QueuedRequest(
         frame: request,
         priority: priority,
         seq: _requestSeq++,
-        onSent: armTimeout,
-        onError: (error) {
-          if (_pendingRpc.remove(commandId) != null) {
-            failPending(error);
-          }
-        },
+        onSent: () => pending.armTimeout(timeout, () {
+          _onRpcTimeout(
+            commandId,
+            'RPC timeout for commandId=$commandId '
+            'after ${timeout.inSeconds}s '
+            'framesReceived=${pending.frames.length}',
+          );
+        }),
+        onError: (error) => _failPendingById(commandId, error),
       ),
     );
 
@@ -546,6 +560,7 @@ class FlipperClient {
       return await pending.future;
     } finally {
       _pendingRpc.remove(commandId);
+      _releaseTxGroup(commandId);
       pending.cancelTimeout();
     }
   }
@@ -571,63 +586,42 @@ class FlipperClient {
       }
       timeoutArmed = true;
       pending.armTimeout(timeout, () {
-        _pendingRpc.remove(commandId);
-        _removeQueuedCommand(commandId, 'multi-frame RPC timeout before TX');
-        if (_activeMultiFrameGroup == commandId) {
-          _activeMultiFrameGroup = null;
-          _signalWorker();
-        }
-        pending.completeError(
-          TimeoutException(
-            'Multi-frame RPC timeout waiting for ACK commandId=$commandId '
-            'after ${timeout.inSeconds}s finalFrameSent=$finalFrameSent '
-            'queued=${_requestQueue.length} pending=${_pendingRpc.keys.toList()}',
-          ),
+        _onRpcTimeout(
+          commandId,
+          'Multi-frame RPC timeout waiting for ACK commandId=$commandId '
+          'after ${timeout.inSeconds}s finalFrameSent=$finalFrameSent '
+          'queued=${_requestQueue.length} pending=${_pendingRpc.keys.toList()}',
         );
       });
     }
 
-    void failPending(Object error) {
-      _pendingRpc.remove(commandId);
-      if (_activeMultiFrameGroup == commandId) {
-        _activeMultiFrameGroup = null;
-        _signalWorker();
-      }
-      pending.cancelTimeout();
-      pending.completeError(error);
-    }
-
-    Future<void> sendFrame(Main frame) async {
+    Future<void> sendFrame(Main frame) {
       frame.commandId = commandId;
-      final completer = Completer<void>();
-      final wasFinal = !frame.hasNext;
+      final sent = Completer<void>();
+      final isFinal = !frame.hasNext;
       _enqueueRequest(
         _QueuedRequest(
           frame: frame,
           priority: priority,
           seq: _requestSeq++,
           onSent: () {
-            if (wasFinal) finalFrameSent = true;
+            if (isFinal) finalFrameSent = true;
             armOrRearmTimeout();
-            if (!completer.isCompleted) completer.complete();
+            if (!sent.isCompleted) sent.complete();
           },
           onError: (error) {
-            if (!completer.isCompleted) completer.completeError(error);
+            if (!sent.isCompleted) sent.completeError(error);
           },
         ),
       );
-      await completer.future;
+      return sent.future;
     }
 
     try {
       try {
         await body(sendFrame);
       } catch (e) {
-        if (_activeMultiFrameGroup == commandId) {
-          _activeMultiFrameGroup = null;
-          _signalWorker();
-        }
-        failPending(e);
+        _failPendingById(commandId, e);
         rethrow;
       }
 
@@ -636,18 +630,15 @@ class FlipperClient {
           'Multi-frame body completed without sending a final frame '
           '(hasNext=false) for commandId=$commandId',
         );
-        failPending(err);
+        _failPendingById(commandId, err);
         throw err;
       }
 
       return await pending.future;
     } finally {
       _pendingRpc.remove(commandId);
+      _releaseTxGroup(commandId);
       pending.cancelTimeout();
-      if (_activeMultiFrameGroup == commandId) {
-        _activeMultiFrameGroup = null;
-        _signalWorker();
-      }
     }
   }
 
@@ -694,6 +685,48 @@ class FlipperClient {
     );
   }
 
+  // ── Pending RPC bookkeeping ────────────────────────────────────────────────
+
+  void _onRpcTimeout(int commandId, String message) {
+    final pending = _pendingRpc.remove(commandId);
+    _removeQueuedCommand(commandId, 'timeout before TX');
+    _releaseTxGroup(commandId);
+    pending?.completeError(TimeoutException(message));
+  }
+
+  void _failPendingById(int commandId, Object error) {
+    final pending = _pendingRpc.remove(commandId);
+    _removeQueuedCommand(commandId, 'request failed');
+    _releaseTxGroup(commandId);
+    pending?.completeError(error);
+  }
+
+  void _releaseTxGroup(int commandId) {
+    if (_txGroupCommandId != commandId) return;
+    _txGroupCommandId = null;
+    _signalWorker();
+  }
+
+  void _removeQueuedCommand(int commandId, String reason) {
+    final before = _requestQueue.length;
+    final removed = <_QueuedRequest>[];
+    _requestQueue.removeWhere((r) {
+      if (r.frame.commandId != commandId) return false;
+      removed.add(r);
+      return true;
+    });
+    if (removed.isEmpty) return;
+    LogService.log(
+      '[RPC] removed ${before - _requestQueue.length} queued frame(s) '
+      'for cmdId=$commandId: $reason',
+    );
+    for (final request in removed) {
+      request.fail(StateError('Request dropped: $reason'));
+    }
+  }
+
+  // ── TX queue / worker ──────────────────────────────────────────────────────
+
   void _enqueueRequest(_QueuedRequest request) {
     var inserted = false;
     for (var i = 0; i < _requestQueue.length; i++) {
@@ -709,33 +742,21 @@ class FlipperClient {
     _signalWorker();
   }
 
-  void _removeQueuedCommand(int commandId, String reason) {
-    final before = _requestQueue.length;
-    _requestQueue.removeWhere((r) => r.frame.commandId == commandId);
-    final removed = before - _requestQueue.length;
-    if (removed > 0) {
-      LogService.log(
-        '[RPC] removed $removed queued frame(s) for cmdId=$commandId: $reason',
-      );
-    }
-  }
-
   void _signalWorker() {
     final signal = _queueSignal;
-    if (signal != null && !signal.isCompleted) {
-      signal.complete();
-    }
+    _queueSignal = null;
+    if (signal != null && !signal.isCompleted) signal.complete();
   }
 
-  void _startWorker() {
-    if (_workerRunning) return;
-    _workerRunning = true;
-    unawaited(_runWorker());
+  void _startWorker(int gen) {
+    if (_workerGen == gen) return;
+    _workerGen = gen;
+    unawaited(_runWorker(gen));
   }
 
   _QueuedRequest? _dequeueNext() {
     if (_requestQueue.isEmpty) return null;
-    final lockedId = _activeMultiFrameGroup;
+    final lockedId = _txGroupCommandId;
     if (lockedId != null) {
       final idx = _requestQueue.indexWhere(
         (r) => r.frame.commandId == lockedId,
@@ -746,87 +767,87 @@ class FlipperClient {
     return _requestQueue.removeAt(0);
   }
 
-  Future<void> _runWorker() async {
-    try {
-      while (_transport != null) {
-        _QueuedRequest? request;
-        if (_mode == FlipperMode.rpc) {
-          request = _dequeueNext();
-        }
-        if (request == null) {
-          final signal = Completer<void>();
-          _queueSignal = signal;
-          if (_mode == FlipperMode.rpc && _dequeueNextPeek()) {
-            _queueSignal = null;
-            continue;
-          }
-          if (_transport == null) break;
-          await signal.future;
-          _queueSignal = null;
-          continue;
-        }
-
-        final transport = _transport;
-        if (transport == null) {
-          request.fail(StateError('Disconnected'));
-          continue;
-        }
-
-        final frame = request.frame;
-        try {
-          final encoded = _Protocol.encode(frame);
-          LogService.log(
-            '[RPC] tx cmdId=${frame.commandId} '
-            'priority=${request.priority.name} '
-            'hasNext=${frame.hasNext} '
-            'content=${frame.whichContent().name} (${encoded.length} bytes)',
-          );
-          await transport.write(encoded);
-          if (frame.commandId != 0) {
-            if (frame.hasNext) {
-              _activeMultiFrameGroup = frame.commandId;
-            }
-          }
-          request.markSent();
-
-          if (!frame.hasNext && frame.commandId != 0) {
-            final pending = _pendingRpc[frame.commandId];
-            if (pending != null) {
-              LogService.log(
-                '[RPC] waiting response for cmdId=${frame.commandId}',
-              );
-              try {
-                await pending.future;
-              } catch (_) {}
-            }
-          }
-        } catch (error) {
-          LogService.log('[RPC] tx error: $error');
-          if (_activeMultiFrameGroup == frame.commandId) {
-            _activeMultiFrameGroup = null;
-          }
-          request.fail(error);
-        }
-      }
-    } finally {
-      _workerRunning = false;
-      _activeMultiFrameGroup = null;
-      for (final queued in _requestQueue) {
-        queued.fail(StateError('Worker stopped'));
-      }
-      _requestQueue.clear();
-      if (_transport != null) {
-        _startWorker();
-      }
-    }
-  }
-
-  bool _dequeueNextPeek() {
+  bool _hasDispatchableRequest() {
     if (_requestQueue.isEmpty) return false;
-    final lockedId = _activeMultiFrameGroup;
+    final lockedId = _txGroupCommandId;
     if (lockedId == null) return true;
     return _requestQueue.any((r) => r.frame.commandId == lockedId);
   }
+
+  /// Drains the request queue for the session generation [gen]. One frame is
+  /// on the wire at a time; after the final frame of a command the worker
+  /// waits for the response (the firmware serializes RPC handlers anyway, and
+  /// this keeps its 1024-byte input buffer from piling up multiple commands).
+  Future<void> _runWorker(int gen) async {
+    while (gen == _sessionGen) {
+      final transport = _transport;
+      if (transport == null) break;
+
+      _QueuedRequest? request;
+      if (_mode == FlipperMode.rpc) {
+        request = _dequeueNext();
+      }
+      if (request == null) {
+        final signal = _queueSignal ??= Completer<void>();
+        if (_mode == FlipperMode.rpc && _hasDispatchableRequest()) {
+          // A request slipped in between dequeue and signal registration.
+          continue;
+        }
+        await signal.future;
+        continue;
+      }
+
+      final frame = request.frame;
+      final encoded = _Protocol.encode(frame);
+      LogService.log(
+        '[RPC] tx cmdId=${frame.commandId} '
+        'priority=${request.priority.name} '
+        'hasNext=${frame.hasNext} '
+        'content=${frame.whichContent().name} (${encoded.length} bytes)',
+      );
+
+      Object? writeError;
+      try {
+        await transport.write(encoded);
+      } catch (error) {
+        writeError = error;
+      }
+      if (gen != _sessionGen) {
+        // Session ended while writing; teardown already failed this request's
+        // pending state, just settle the queue entry.
+        request.fail(writeError ?? StateError('Disconnected'));
+        break;
+      }
+      if (writeError != null) {
+        LogService.log('[RPC] tx error: $writeError');
+        _releaseTxGroup(frame.commandId);
+        request.fail(writeError);
+        // A dead transport announces itself through its done event, which
+        // triggers the session teardown; nothing more to do here.
+        continue;
+      }
+
+      if (frame.commandId != 0 && frame.hasNext) {
+        _txGroupCommandId = frame.commandId;
+      }
+      request.markSent();
+
+      if (frame.commandId != 0 && !frame.hasNext) {
+        _releaseTxGroup(frame.commandId);
+        final pending = _pendingRpc[frame.commandId];
+        if (pending != null) {
+          LogService.log('[RPC] waiting response for cmdId=${frame.commandId}');
+          await pending.settled;
+        }
+      }
+    }
+
+    if (_workerGen == gen) {
+      _workerGen = null;
+    }
+  }
+
+  // ── Device discovery plumbing ──────────────────────────────────────────────
 
   Future<List<FlipperDevice>> _loadUsbDevices() async {
     final result = await _usbPlatform.loadDevices();
@@ -899,6 +920,8 @@ class FlipperClient {
     );
   }
 
+  // ── RX path ────────────────────────────────────────────────────────────────
+
   void _onTransportBytes(List<int> chunk) {
     _rawCtrl.add(chunk);
 
@@ -931,6 +954,7 @@ class FlipperClient {
   }
 
   void _routeFrame(Main frame) {
+    _rxParseErrorStreak = 0;
     _messageCtrl.add(frame);
 
     if (frame.hasSystemDeviceInfoResponse()) {
@@ -948,6 +972,26 @@ class FlipperClient {
     final commandId = frame.commandId;
     if (commandId == 0) {
       LogService.log('[RPC] rx broadcast content=${frame.whichContent().name}');
+      final error = _exceptionFromResponse(frame);
+      if (error != null && !_errorCtrl.isClosed) {
+        _errorCtrl.add(error);
+      }
+      if (frame.commandStatus == CommandStatus.ERROR_DECODE) {
+        // The firmware lost protobuf framing on its RX side; it closes the
+        // RPC session right after sending this (and tears the whole BLE link
+        // down). End our session cleanly with the real reason instead of
+        // waiting for the link to vanish with a generic timeout.
+        LogService.log('[RPC] firmware reported ERROR_DECODE; session is dead');
+        unawaited(
+          _teardown(
+            reason: FlipperTransportError(
+              'Firmware reported a protobuf decode error and closed the '
+              'RPC session',
+            ),
+          ),
+        );
+        return;
+      }
       _broadcastCtrl.add(frame);
       return;
     }
@@ -974,11 +1018,7 @@ class FlipperClient {
     }
 
     _pendingRpc.remove(commandId);
-    pending.cancelTimeout();
-    if (_activeMultiFrameGroup == commandId) {
-      _activeMultiFrameGroup = null;
-      _signalWorker();
-    }
+    _releaseTxGroup(commandId);
     final error = _exceptionFromResponse(frame);
     if (error != null) {
       if (!_errorCtrl.isClosed) _errorCtrl.add(error);
@@ -989,71 +1029,72 @@ class FlipperClient {
   }
 
   void _onFrameParseError(Object error) {
-    final transport = _transport;
-    if (transport == null) return;
+    _rxParseErrorStreak++;
+    LogService.log(
+      '[RPC] rx parse error ($_rxParseErrorStreak/$_maxRxParseErrorStreak): '
+      '$error',
+    );
+    if (_rxParseErrorStreak < _maxRxParseErrorStreak) return;
+    // The inbound byte stream is desynchronized beyond recovery. Close the
+    // session calmly with a clear reason; feeding garbage to listeners or
+    // poking the firmware's reset characteristic (which restarts its whole
+    // BLE stack) would only turn one bad frame into a surprise link drop.
     unawaited(
-      transport.restartRpc().catchError((e) {
-        LogService.log('[RPC] restart failed after parse error: $e');
-      }),
+      _teardown(
+        reason: FlipperTransportError('RPC byte stream desynchronized: $error'),
+      ),
     );
   }
 
-  void _onTransportError(Object error, StackTrace stackTrace) {
-    LogService.log('[FlipperClient] transport error: $error');
-    if (_transport == null) return;
-    unawaited(disconnect());
-  }
-
-  void _onTransportDone() {
-    if (_transport == null) return;
-    unawaited(disconnect());
-  }
+  // ── CLI text matching ──────────────────────────────────────────────────────
 
   Future<void> _ensureCliPrompt() async {
     final transport = _requireTransport();
-    final completer = Completer<void>();
-    final chunks = <String>[];
-
-    late final StreamSubscription<String> sub;
-    sub = textStream.listen((chunk) {
-      chunks.add(chunk);
-      if (chunks.join().contains(FlipperClient.cliPrompt) &&
-          !completer.isCompleted) {
-        completer.complete();
-      }
-    });
-
-    try {
-      await transport.nudgeCli();
-      await completer.future.timeout(
-        const Duration(seconds: 5),
-        onTimeout: () => throw TimeoutException('CLI prompt timeout'),
-      );
-    } finally {
-      await sub.cancel();
+    final seen = await _waitForTextMatch(
+      (text) => text.contains(FlipperClient.cliPrompt),
+      timeout: const Duration(seconds: 5),
+      trigger: transport.nudgeCli,
+    );
+    if (!seen) {
+      throw TimeoutException('CLI prompt timeout');
     }
   }
 
-  Future<void> _waitForText(
+  /// Listens on [textStream] until the accumulated text satisfies [test] or
+  /// [timeout] elapses. Returns whether a match was seen — timeouts are a
+  /// result, not an exception. [trigger] runs after the listener is attached;
+  /// its write errors are logged and surface as a non-match.
+  Future<bool> _waitForTextMatch(
     bool Function(String text) test, {
     required Duration timeout,
+    Future<void> Function()? trigger,
   }) async {
-    final completer = Completer<void>();
-    final chunks = <String>[];
+    final matched = Completer<bool>();
+    final chunks = StringBuffer();
 
-    late final StreamSubscription<String> sub;
-    sub = textStream.listen((chunk) {
-      chunks.add(chunk);
-      if (test(chunks.join()) && !completer.isCompleted) {
-        completer.complete();
+    final sub = textStream.listen((chunk) {
+      if (matched.isCompleted) return;
+      chunks.write(chunk);
+      if (test(chunks.toString())) {
+        matched.complete(true);
       }
     });
+    final timer = Timer(timeout, () {
+      if (!matched.isCompleted) matched.complete(false);
+    });
 
-    try {
-      await completer.future.timeout(timeout);
-    } finally {
-      await sub.cancel();
+    if (trigger != null) {
+      unawaited(
+        trigger().catchError((Object error) {
+          LogService.log('[CLI] trigger write failed: $error');
+        }),
+      );
     }
+
+    final result = await matched.future;
+    timer.cancel();
+    await sub.cancel();
+    return result;
   }
 
   String _trimCliResult(String raw, String command) {
@@ -1105,7 +1146,7 @@ class FlipperClient {
     await _deviceInfoWatchCtrl.close();
   }
 
-  void _setMode(FlipperMode mode) {
+  void _setMode(FlipperMode mode, {Object? closeReason}) {
     if (_mode == mode) return;
     _mode = mode;
     _modeCtrl.add(mode);
@@ -1114,24 +1155,29 @@ class FlipperClient {
         mode: mode,
         device: _connectedDevice,
         connected: mode != FlipperMode.disconnected,
+        closeReason: closeReason,
       ),
     );
     if (mode == FlipperMode.rpc && getName() == null) {
-      unawaited(_autoFetchDeviceInfo());
+      unawaited(_autoFetchDeviceInfo(_sessionGen));
     }
   }
 
-  Future<void> _autoFetchDeviceInfo() async {
+  Future<void> _autoFetchDeviceInfo(int gen) async {
     try {
       await deviceInfo(priority: FlipperRequestPriority.foreground);
-      _deviceInfoFetched = true;
-      final snapshot = deviceInfoCache;
-      if (!_deviceInfoWatchCtrl.isClosed) {
-        _deviceInfoWatchCtrl.add(snapshot);
-      }
-      if (!_deviceInfoCompleteCtrl.isClosed) {
-        _deviceInfoCompleteCtrl.add(snapshot);
-      }
-    } catch (_) {}
+    } catch (error) {
+      LogService.log('[FlipperClient] device info auto-fetch failed: $error');
+      return;
+    }
+    if (gen != _sessionGen) return;
+    _deviceInfoFetched = true;
+    final snapshot = deviceInfoCache;
+    if (!_deviceInfoWatchCtrl.isClosed) {
+      _deviceInfoWatchCtrl.add(snapshot);
+    }
+    if (!_deviceInfoCompleteCtrl.isClosed) {
+      _deviceInfoCompleteCtrl.add(snapshot);
+    }
   }
 }

@@ -49,9 +49,16 @@ class FlipperConnectionState {
   final FlipperDevice? device;
   final bool connected;
 
+  /// Why the session ended (only meaningful when [connected] is false after a
+  /// previously established connection). Carries the transport fault — e.g.
+  /// "Flipper closed the RPC session" — so UIs can report the problem calmly
+  /// instead of guessing from a bare disconnect.
+  final Object? closeReason;
+
   const FlipperConnectionState({
     required this.mode,
     required this.device,
     required this.connected,
+    this.closeReason,
   });
 }

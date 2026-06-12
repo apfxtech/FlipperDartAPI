@@ -217,20 +217,8 @@ class _MacosBleTransport extends _UniversalBleTransportBase {
     return transport;
   }
 
-  // Fix: subscribe to rpcStatus so firmware auto-starts RPC session on macOS.
   @override
   Future<void> _openExtra() async {
-    final svc = _rpcStatusSvcId;
-    final chr = _rpcStatusCharId;
-    if (svc == null || chr == null) return;
-    try {
-      await _ops
-          .subscribeNotifications(_device.device.deviceId, svc, chr)
-          .timeout(const Duration(seconds: 4));
-      LogService.log('[BLE] macOS: subscribed to rpcStatus');
-    } catch (e) {
-      LogService.log('[BLE] macOS: rpcStatus subscribe failed (non-fatal): $e');
-    }
     // After all subscriptions are registered, pause before sending any RPC data.
     // This gives the Flipper firmware time to send an L2CAP Connection Parameter
     // Update Request; macOS accepts it and negotiates a shorter connection interval
@@ -240,8 +228,4 @@ class _MacosBleTransport extends _UniversalBleTransportBase {
     await Future.delayed(const Duration(milliseconds: 300));
     LogService.log('[BLE] macOS: connection parameter settle complete');
   }
-
-  // Writing to rpcStatus on macOS triggers an ATT error that drops the link.
-  @override
-  bool get _canWriteRpcStatus => false;
 }

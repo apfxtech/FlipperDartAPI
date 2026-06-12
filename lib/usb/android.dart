@@ -89,7 +89,7 @@ class _AndroidUsbTransport extends _Transport {
 
   @override
   Future<void> rawWrite(Uint8List bytes) async {
-    if (_closed) {
+    if (!isActive) {
       throw StateError('Transport closed');
     }
     await _port.write(bytes);
@@ -97,7 +97,7 @@ class _AndroidUsbTransport extends _Transport {
 
   @override
   Future<void> nudgeCli() async {
-    if (_closed) {
+    if (!isActive) {
       throw StateError('Transport closed');
     }
     await _port.setDTR(false);

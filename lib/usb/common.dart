@@ -245,9 +245,9 @@ abstract class _SerialUsbTransportBase extends _Transport {
   }
 
   @override
-  Future<void> rawWrite(Uint8List bytes) async {
-    if (_closed) {
-      throw StateError('Transport closed');
+  Future<void> rawWrite(Uint8List bytes) {
+    if (!isActive) {
+      return Future.error(StateError('Transport closed'));
     }
     final seq = _writeSeq++;
     final completer = Completer<void>();
@@ -258,7 +258,7 @@ abstract class _SerialUsbTransportBase extends _Transport {
 
   @override
   Future<void> nudgeCli() async {
-    if (_closed) {
+    if (!isActive) {
       throw StateError('Transport closed');
     }
     _commandPort.send(const DesktopUsbDtrPulse());
@@ -266,33 +266,29 @@ abstract class _SerialUsbTransportBase extends _Transport {
     await writeAscii('\r');
   }
 
+  void _failInFlight(Object error) {
+    final pending = List<Completer<void>>.from(_inFlight.values);
+    _inFlight.clear();
+    for (final completer in pending) {
+      if (!completer.isCompleted) completer.completeError(error);
+    }
+  }
+
   @override
   void onFaultExtra(Object error) {
-    for (final pending in _inFlight.values) {
-      if (!pending.isCompleted) pending.completeError(error);
-    }
-    _inFlight.clear();
+    _failInFlight(error);
     if (!_exited.isCompleted) _exited.complete();
   }
 
   @override
   Future<void> doClose() async {
-    try {
-      _commandPort.send(const DesktopUsbShutdown());
-      await _exited.future.timeout(
-        const Duration(seconds: 2),
-        onTimeout: () {},
-      );
-    } catch (_) {}
+    // SendPort.send to a dead isolate is a silent no-op, so no guard needed.
+    _commandPort.send(const DesktopUsbShutdown());
+    await _exited.future.timeout(const Duration(seconds: 2), onTimeout: () {});
     _isolate.kill(priority: Isolate.beforeNextEvent);
     await _eventSub?.cancel();
     _eventSub = null;
     _eventPort.close();
-    for (final pending in _inFlight.values) {
-      if (!pending.isCompleted) {
-        pending.completeError(StateError('Transport closed'));
-      }
-    }
-    _inFlight.clear();
+    _failInFlight(StateError('Transport closed'));
   }
 }
