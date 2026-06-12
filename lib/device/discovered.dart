@@ -12,14 +12,14 @@ abstract class DiscoveredDevice {
   DeviceTransport get transport;
 }
 
-// ── USB discovered (abstract) ─────────────────────────────────────
+// USB discovered (abstract)
 
 abstract class UsbDiscoveredDevice implements DiscoveredDevice {
   @override
   DeviceTransport get transport => DeviceTransport.usb;
 }
 
-// ── BLE discovered ────────────────────────────────────────────────
+// BLE discovered
 
 class BleDiscoveredDevice implements DiscoveredDevice {
   final uble.BleDevice device;
@@ -38,7 +38,7 @@ class BleDiscoveredDevice implements DiscoveredDevice {
   int get rssi => device.rssi?.toInt() ?? 0;
 }
 
-// ── Android USB discovered ────────────────────────────────────────
+// Android USB discovered
 
 class AndroidUsbDiscoveredDevice extends UsbDiscoveredDevice {
   final UsbDevice usbDevice;
@@ -56,7 +56,7 @@ class AndroidUsbDiscoveredDevice extends UsbDiscoveredDevice {
   }
 }
 
-// ── Desktop USB discovered (Windows / macOS / Linux) ─────────────
+// Desktop USB discovered (Windows / macOS / Linux)
 
 class DesktopUsbDiscoveredDevice extends UsbDiscoveredDevice {
   final String portName;

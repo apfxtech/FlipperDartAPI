@@ -11,17 +11,11 @@ class FlipperTransportError implements Exception {
 
 enum _TransportLifecycle { active, closing, closed }
 
-/// Base class for byte transports (BLE / USB serial).
-///
-/// Lifecycle contract:
-///  * [open] is called exactly once after construction.
-///  * Outbound data goes through [write]; the base class serializes writes so
-///    [rawWrite] never runs concurrently.
-///  * A transport that dies unexpectedly calls [onTransportFault] once with
-///    the reason: pending writes fail, [bytesStream] closes *without* an error
-///    event, and [closeReason] keeps the diagnosis for the client to report.
-///  * [close] is the orderly shutdown initiated by the client; it never
-///    throws.
+// Byte transport (BLE / USB serial). Writes are serialized: rawWrite never
+// runs concurrently. An unexpected death goes through onTransportFault exactly
+// once: pending writes fail, bytesStream closes without an error event, and
+// closeReason keeps the diagnosis. close() is the orderly path and never
+// throws.
 abstract class _Transport {
   final _bytesCtrl = StreamController<List<int>>.broadcast();
   final List<_TransportPendingWrite> _writeQueue = [];
@@ -96,8 +90,6 @@ abstract class _Transport {
     }
   }
 
-  /// Marks the transport dead after an unexpected failure. Idempotent; safe to
-  /// call from platform callbacks. Never throws.
   void onTransportFault(Object reason) {
     if (_lifecycle == _TransportLifecycle.closed) return;
     _lifecycle = _TransportLifecycle.closed;
@@ -110,8 +102,8 @@ abstract class _Transport {
     }
   }
 
-  /// Subclass hook to release platform resources and wake internal waiters
-  /// after a fault. Must not throw.
+  // Releases platform resources and wakes internal waiters after a fault.
+  // Must not throw.
   void onFaultExtra(Object error) {}
 
   Future<void> close() async {

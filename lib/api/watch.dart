@@ -33,7 +33,7 @@ extension FlipperWatchApi on FlipperClient {
 
     bool alive() => gen == _collectionGen && isConnected;
 
-    // ── Phase 1: initial burst ────────────────────────────────────────────
+    // Phase 1: initial burst
 
     final infoWasFetched = _deviceInfoFetched;
 
@@ -131,7 +131,7 @@ extension FlipperWatchApi on FlipperClient {
       }
     }());
 
-    // ── Phase 2: periodic loop ────────────────────────────────────────────
+    // Phase 2: periodic loop
 
     var tick = 0;
     const interval = Duration(seconds: 5);

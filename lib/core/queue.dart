@@ -1,9 +1,8 @@
 part of '../flipper_client.dart';
 
-/// One outbound RPC frame waiting for its turn on the transport.
-///
-/// Settles exactly once: [markSent] when the frame was handed to the
-/// transport, or [fail] when it never made it out.
+// One outbound RPC frame waiting for its turn on the transport. Settles
+// exactly once: markSent after the frame was handed to the transport, fail if
+// it never made it out.
 class _QueuedRequest implements Comparable<_QueuedRequest> {
   final Main frame;
   final FlipperRequestPriority priority;
@@ -32,6 +31,11 @@ class _QueuedRequest implements Comparable<_QueuedRequest> {
     onError?.call(error);
   }
 
+  String describe() {
+    return 'cmdId=${frame.commandId} content=${frame.whichContent().name} '
+        'priority=${priority.name} hasNext=${frame.hasNext}';
+  }
+
   @override
   int compareTo(_QueuedRequest other) {
     final byPriority = priority.index.compareTo(other.priority.index);
@@ -40,8 +44,8 @@ class _QueuedRequest implements Comparable<_QueuedRequest> {
   }
 }
 
-/// In-flight RPC call: collects response frames and owns the response
-/// watchdog timer. Completes exactly once.
+// In-flight RPC call: collects response frames and owns the response watchdog
+// timer. Completes exactly once.
 class _PendingRpc {
   final int commandId;
   final List<Main> frames = [];
@@ -51,17 +55,20 @@ class _PendingRpc {
   Duration? _watchdogTimeout;
   void Function()? _watchdogCallback;
 
-  _PendingRpc(this.commandId);
+  _PendingRpc(this.commandId) {
+    // Multi-frame requests may fail while their body is still being sent,
+    // before the caller reaches `await future`; without this the error would
+    // be reported as unhandled.
+    unawaited(_completer.future.catchError((Object _) => <Main>[]));
+  }
 
   void Function(Main frame)? onFrame;
 
   Future<List<Main>> get future => _completer.future;
 
-  /// Resolves when the call settles — success or failure — and never errors.
-  /// Lets the TX worker wait for the response without try/catch.
+  // Resolves when the call settles — success or failure — and never errors,
+  // so the TX worker can wait for the response without try/catch.
   Future<void> get settled => _settled.future;
-
-  bool get isDone => _completer.isCompleted;
 
   void add(Main frame) {
     frames.add(frame);
@@ -112,7 +119,7 @@ class _PendingRpc {
   }
 }
 
-/// One buffered transport write. Settles exactly once.
+// One buffered transport write. Settles exactly once.
 class _TransportPendingWrite {
   final Uint8List bytes;
   final Completer<void> _completer = Completer<void>();

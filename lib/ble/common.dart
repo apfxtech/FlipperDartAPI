@@ -1,7 +1,5 @@
 part of '../flipper_client.dart';
 
-// ── BLE service / characteristic model ──────────────────────────────────────
-
 class _BleService {
   final String uuid;
   final List<_BleChar> characteristics;
@@ -25,15 +23,11 @@ class _BleChar {
 
 enum _BleConnState { connected, connecting, disconnected }
 
-// ── BLE operations adapter ───────────────────────────────────────────────────
-
 abstract class _BleOps {
-  // Connection / disconnection change callback (set by transport, cleared on close)
   set onConnectionChange(
     void Function(String deviceId, bool isConnected, String? error)? cb,
   );
 
-  // Characteristic value change callback
   set onValueChange(
     void Function(String deviceId, String charId, Uint8List value, int? mtu)?
     cb,
@@ -63,8 +57,6 @@ abstract class _BleOps {
   Future<void> disconnect(String deviceId);
   Future<_BleConnState?> getConnectionState(String deviceId);
 }
-
-// ── universal_ble adapter (all platforms except macOS) ──────────────────────
 
 class _UniversalBleOps implements _BleOps {
   @override
@@ -132,13 +124,29 @@ class _UniversalBleOps implements _BleOps {
     String charId,
     Uint8List data, {
     bool withoutResponse = false,
-  }) => uble.UniversalBle.write(
-    deviceId,
-    svcId,
-    charId,
-    data,
-    withoutResponse: withoutResponse,
-  );
+  }) async {
+    final stopwatch = Stopwatch()..start();
+    final mode = withoutResponse ? 'withoutResponse' : 'withResponse';
+    try {
+      await uble.UniversalBle.write(
+        deviceId,
+        svcId,
+        charId,
+        data,
+        withoutResponse: withoutResponse,
+      );
+      LogService.log(
+        '[UniversalBle] write done len=${data.length} mode=$mode '
+        'elapsedMs=${stopwatch.elapsedMilliseconds}',
+      );
+    } catch (error) {
+      LogService.log(
+        '[UniversalBle] write failed len=${data.length} mode=$mode '
+        'elapsedMs=${stopwatch.elapsedMilliseconds} error=$error',
+      );
+      rethrow;
+    }
+  }
 
   @override
   Future<void> disconnect(String deviceId) =>
@@ -159,14 +167,12 @@ class _UniversalBleOps implements _BleOps {
   }
 }
 
-// ── _BlePlatform interface ───────────────────────────────────────────────────
-
 abstract class _BlePlatform {
   Future<void> requestPermissions();
 
-  // Already-bonded / system-known devices. This is an instant lookup, not a
-  // scan, so it is queried once at the start of every scan to surface devices
-  // that are connected but not currently advertising.
+  // Already-bonded / system-known devices: an instant lookup (not a scan),
+  // queried once at the start of every scan to surface devices that are
+  // connected but not currently advertising.
   Future<List<BleDiscoveredDevice>> loadKnownDevices();
 
   bool includeDevice(BleDiscoveredDevice device);
@@ -187,9 +193,6 @@ abstract class _UniversalBlePlatformBase implements _BlePlatform {
     return const <BleDiscoveredDevice>[];
   }
 
-  // Unified, platform-independent Flipper identification. A device is a Flipper
-  // if it advertises the Flipper GATT service, carries the Flipper MAC OUI, or
-  // its advertised name contains "flipper" / "flip_".
   @override
   bool includeDevice(BleDiscoveredDevice device) {
     if (_advertisesFlipperService(device)) return true;
@@ -210,43 +213,43 @@ abstract class _UniversalBlePlatformBase implements _BlePlatform {
   }
 }
 
-// ── Base BLE transport ───────────────────────────────────────────────────────
-//
-// Firmware contract (targets/f7/ble_glue/services/serial_service.c +
-// applications/services/bt/bt_service/bt.c):
-//
-//  * Flow control: the firmware grants a credit of RPC_BUFFER_SIZE (1024)
-//    bytes. It counts every byte written to the RX characteristic against
-//    that credit and sends a flow-control notification — always carrying the
-//    full buffer size — only after the credit hit zero AND its RPC thread
-//    drained the buffer. Exceeding the credit risks dropped bytes (the GAP
-//    thread feeds RPC with a 1 s timeout), which desynchronizes the protobuf
-//    varint framing; the firmware then answers ERROR_DECODE and restarts its
-//    whole BLE stack — an "unexpected" link drop on the client side.
-//
-//  * Session readiness: the rpcStatus characteristic is 1 only while the
-//    firmware's RPC session is open. The session opens on the GAP "connected"
-//    event (after pairing), which can be LATER than our GATT subscriptions:
-//    anything written before that is silently discarded by the firmware
-//    (serial-service callback is still NULL), desynchronizing framing the
-//    same way. TX therefore waits for rpcStatus to become active, and a
-//    mid-session transition to 0 means the firmware closed the session.
-//
-//  * Writing 0 to rpcStatus asks the firmware to restart its BLE stack
-//    (deliberate link drop) — never do that as an "error recovery".
+// Firmware contract (serial_service.c, bt.c, rpc.c in unleashed-firmware):
+// - Flow control: the firmware grants RPC_BUFFER_SIZE (1024) bytes of credit,
+//   counts every byte written to RX against it, and notifies a fresh full
+//   credit only after the counter hit zero AND its RPC thread drained the
+//   buffer. Sending past the credit drops bytes (1 s feed timeout) and breaks
+//   the protobuf varint framing permanently.
+// - rpcStatus is 1 only while the firmware RPC session is open. The session
+//   opens on the GAP connected event (after pairing), which is later than our
+//   GATT subscriptions; bytes written earlier are silently discarded. After a
+//   decode error the firmware sends ERROR_DECODE and restarts its whole BLE
+//   stack.
+// - Writing 0 to rpcStatus restarts the firmware BLE stack. Never write it.
 abstract class _UniversalBleTransportBase extends _Transport {
   static const String overflowCharUuid = '19ed82ae-ed21-4c9d-4145-228e63fe0000';
   static const String rpcStatusCharUuid =
       '19ed82ae-ed21-4c9d-4145-228e64fe0000';
   static const int _bleChunkSize = 512;
   static const int _minBleMtuSize = 20;
-  // Flipper supports ATT_MTU=414, leaving 411 bytes for a Write Command.
-  static const int _maxBleMtuSize = 411;
-  // CoreBluetooth (and most backends) never time a connect attempt out on
-  // their own — a wedged peripheral leaves the future pending forever and the
-  // UI silent. Encryption of a bonded link happens inside this step too, so
-  // the budget covers a slow re-encryption but not an eternal hang.
+  // DO NOT CHANGE: 160 is the empirically stable ATT write payload for this
+  // firmware. Raising it toward the 411-byte ATT_MTU ceiling makes link drops
+  // far more frequent.
+  static const int _maxBleMtuSize = 160;
+  // Platform connect attempts never time out on their own (CoreBluetooth keeps
+  // them pending forever); bonded-link re-encryption also happens inside this
+  // step.
   static const Duration _connectTimeout = Duration(seconds: 20);
+  // TX stall watchdog: with data pending, the firmware must grant credit /
+  // activate the session well within this window; silence means the session
+  // is dead and every queued task must settle instead of hanging.
+  static const Duration _stallPoll = Duration(seconds: 5);
+  static const int _stallPollLimit = 6;
+
+  // Exactly one transport may own the platform link at a time. A stale
+  // attempt's timeout or close must never disconnect a newer connection.
+  static int _connectAttemptGen = 0;
+  static _UniversalBleTransportBase? _connectionOwner;
+  static _UniversalBleTransportBase? _activeTransport;
 
   final BleDiscoveredDevice _device;
   final _BleOps _ops;
@@ -271,9 +274,8 @@ abstract class _UniversalBleTransportBase extends _Transport {
   final List<_BlePendingSend> _txQueue = [];
   Completer<void>? _txDataSignal;
 
-  // Flow-control credit: bytes we may still send before the next firmware
-  // notification. _budgetGen lets a send cycle detect that a fresh
-  // (authoritative) credit arrived while a write was in flight.
+  // Flow-control credit mirror. _budgetGen detects that a fresh authoritative
+  // credit notification arrived while a write was in flight.
   int _budget = 0;
   int _budgetGen = 0;
   Completer<void>? _budgetSignal;
@@ -286,17 +288,18 @@ abstract class _UniversalBleTransportBase extends _Transport {
   Completer<void>? _disconnectSignal;
   bool _senderRunning = false;
   _BleLinkState _link = _BleLinkState.disconnected;
-
-  static _UniversalBleTransportBase? _activeTransport;
+  bool _platformConnectionEstablished = false;
 
   _UniversalBleTransportBase(this._device, this._ops);
 
-  // Override to subscribe to extra characteristics / settle delays after the
-  // base subscriptions are in place (e.g. macOS connection-parameter settle).
+  // Platform hook that runs after all subscriptions are in place
+  // (macOS: connection-parameter settle).
   Future<void> _openExtra() async {}
 
   Future<void> _configure() async {
     final deviceId = _device.device.deviceId;
+    final connectAttempt = ++_connectAttemptGen;
+    _connectionOwner = this;
     var connectTimedOut = false;
     await _ops.connect(deviceId).timeout(
       _connectTimeout,
@@ -305,29 +308,55 @@ abstract class _UniversalBleTransportBase extends _Transport {
       },
     );
     if (connectTimedOut) {
-      // Cancel the still-pending platform connect attempt so the next try
-      // starts clean instead of stacking on a wedged one.
-      unawaited(
-        _ops.disconnect(deviceId).catchError((Object e) {
-          LogService.log('[BLE] connect-timeout cancel failed: $e');
-        }),
-      );
+      if (connectAttempt == _connectAttemptGen &&
+          identical(_connectionOwner, this)) {
+        unawaited(
+          _ops.disconnect(deviceId).catchError((Object e) {
+            LogService.log('[BLE] connect-timeout cancel failed: $e');
+          }),
+        );
+      }
       throw FlipperTransportError(
         'BLE connect timeout after ${_connectTimeout.inSeconds}s '
         '(device unreachable, or its bond/encryption is stalled — '
         'try forgetting the pairing on both sides)',
       );
     }
+    _platformConnectionEstablished = true;
+    if (connectAttempt != _connectAttemptGen) {
+      // A newer attempt owns the platform link now; do not touch it.
+      throw StateError('BLE connection attempt superseded');
+    }
+    try {
+      await _configureConnected(deviceId);
+    } catch (_) {
+      // The factory never returns this transport, so nobody will close() it:
+      // the platform link must be released here or it leaks as a ghost
+      // connection.
+      if (identical(_connectionOwner, this)) {
+        _connectionOwner = null;
+        _platformConnectionEstablished = false;
+        unawaited(
+          _ops.disconnect(deviceId).catchError((Object e) {
+            LogService.log('[BLE] cleanup disconnect failed: $e');
+          }),
+        );
+      }
+      rethrow;
+    }
+  }
+
+  Future<void> _configureConnected(String deviceId) async {
     int negotiatedMtu = 23;
     try {
-      negotiatedMtu = await _ops.requestMtu(_device.device.deviceId, 517);
+      negotiatedMtu = await _ops.requestMtu(deviceId, 517);
     } catch (e) {
       LogService.log(
         '[BLE] requestMtu failed: $e (using default $negotiatedMtu)',
       );
     }
 
-    final services = await _ops.discoverServices(_device.device.deviceId);
+    final services = await _ops.discoverServices(deviceId);
     String? txSvc;
     String? txChar;
     String? rxSvc;
@@ -347,7 +376,10 @@ abstract class _UniversalBleTransportBase extends _Transport {
         if (cid == FlipperClient.bleTxUuid) {
           txSvc = service.uuid;
           txChar = char.uuid;
-          txWithResponse = !char.canWriteNoRsp;
+          // Write WITH response: each ATT write is acknowledged by the
+          // peripheral before the next one goes out. Empirically stable on
+          // this firmware; do not switch to write-without-response.
+          txWithResponse = char.canWrite;
         }
         if (cid == FlipperClient.bleRxUuid) {
           rxSvc = service.uuid;
@@ -394,9 +426,8 @@ abstract class _UniversalBleTransportBase extends _Transport {
     _overflowCharIdLower = _overflowCharId!.toLowerCase();
     _rpcStatusCharIdLower = _rpcStatusCharId!.toLowerCase();
     LogService.log(
-      '[BLE] negotiatedMtu=$negotiatedMtu chunk=$_bleChunkSize '
-      'mtu=$_bleMtuSize '
-      'txWithResponse=$_txWithResponse overflowControl=true rpcStatus=true',
+      '[BLE] configured: negotiatedMtu=$negotiatedMtu mtu=$_bleMtuSize '
+      'txWithResponse=$_txWithResponse',
     );
   }
 
@@ -435,6 +466,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
     await _subscribeRpcStatus(deviceId);
     await _openExtra();
     _startSender();
+    LogService.log('[BLE] transport open (rpcSession=$_rpcSessionActive)');
   }
 
   Future<void> _subscribeRpcStatus(String deviceId) async {
@@ -448,12 +480,9 @@ abstract class _UniversalBleTransportBase extends _Transport {
       final initial = await _ops.read(deviceId, svc, chr);
       _rpcStatusAvailable = true;
       _applyRpcStatusValue(initial);
-      LogService.log(
-        '[BLE] rpcStatus subscribed, sessionActive=$_rpcSessionActive',
-      );
     } catch (e) {
-      // Without rpcStatus we cannot observe session readiness; fall back to
-      // ungated TX (pre-existing behavior) instead of blocking forever.
+      // Without rpcStatus, session readiness cannot be observed; fall back to
+      // ungated TX instead of holding the queue forever.
       _rpcStatusAvailable = false;
       LogService.log('[BLE] rpcStatus unavailable, TX gating disabled: $e');
     }
@@ -469,7 +498,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
               '(likely supervision timeout / peer reset / out of range)'
         : 'backend connectionChange disconnected: $platformError';
     final diagnostics =
-        'link=${_link.name} budget=$_budget txQueue=${_txQueue.length} '
+        'link=${_link.name} budget=$_budget txPending=${_txQueue.length} '
         'rpcSession=${_rpcStatusAvailable ? _rpcSessionActive : 'unknown'}';
     _markBleDisconnected();
     if (!wasDisconnecting) {
@@ -500,52 +529,47 @@ abstract class _UniversalBleTransportBase extends _Transport {
 
   void _applyOverflowValue(List<int> value) {
     final bytes = value is Uint8List ? value : Uint8List.fromList(value);
-    final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
     final view = ByteData.view(
       bytes.buffer,
       bytes.offsetInBytes,
       bytes.lengthInBytes,
     );
+    // serial_service.c stores the credit big-endian (REVERSE_BYTES_U32).
     int remaining;
     if (bytes.length >= 4) {
       remaining = view.getUint32(0, Endian.big);
     } else if (bytes.length >= 2) {
       remaining = view.getUint16(0, Endian.big);
     } else {
-      LogService.log('[BLE] overflow: payload too short hex=[$hex]');
+      LogService.log('[BLE] overflow value too short (${bytes.length} bytes)');
       return;
     }
     _budget = remaining;
     _budgetGen += 1;
-    LogService.log(
-      '[BLE] overflow remaining=$remaining hex=[$hex] (gen $_budgetGen)',
-    );
-    _fireSignal(_budgetSignal);
+    LogService.log('[BLE] credit granted: $remaining bytes (gen $_budgetGen)');
+    final signal = _budgetSignal;
     _budgetSignal = null;
+    _fireSignal(signal);
   }
 
   void _applyRpcStatusValue(List<int> value) {
     final active = value.any((b) => b != 0);
     if (active == _rpcSessionActive) return;
     _rpcSessionActive = active;
-    LogService.log(
-      '[BLE] rpcStatus -> ${active ? 'active' : 'inactive'} (link=${_link.name})',
-    );
+    LogService.log('[BLE] rpcSession=${active ? 'active' : 'inactive'}');
     if (active) {
-      _fireSignal(_rpcActiveSignal);
+      final signal = _rpcActiveSignal;
       _rpcActiveSignal = null;
+      _fireSignal(signal);
       return;
     }
     if (!isActive || _link != _BleLinkState.connected) return;
-    // The firmware deactivated the RPC session mid-connection. It does this
-    // right before tearing the link down (e.g. after a protobuf decode error),
-    // so report the real cause now instead of a generic timeout later.
+    // The firmware deactivates the session right before tearing the link down
+    // (e.g. after a decode error); report the real cause now.
     onTransportFault(
       FlipperTransportError('Flipper closed the RPC session (rpcStatus=0)'),
     );
   }
-
-  // ── TX path ────────────────────────────────────────────────────────────────
 
   @override
   Future<void> rawWrite(Uint8List bytes) {
@@ -554,12 +578,8 @@ abstract class _UniversalBleTransportBase extends _Transport {
     }
     if (bytes.isEmpty) return Future.value();
 
-    // The returned future resolves at different points per write mode:
-    //   WWNR — when the sender *picks up* the frame (rendezvous, like
-    //           writeSync + onSendCallback in flipper-android); the BLE write
-    //           continues in the background and the overflow credit is the
-    //           real backpressure. Queue depth stays ≤1 frame.
-    //   WR   — after the peer ACKed the frame's last chunk.
+    // Resolves only after the complete frame crossed every overflow-credit
+    // boundary, keeping the RPC worker blocked until then.
     final pending = _BlePendingSend(bytes);
     _txQueue.add(pending);
     final signal = _txDataSignal;
@@ -576,45 +596,74 @@ abstract class _UniversalBleTransportBase extends _Transport {
   }
 
   Future<void> _runSender() async {
+    var sessionPolls = 0;
+    var budgetPolls = 0;
     while (isActive) {
       if (_txQueue.isEmpty) {
+        sessionPolls = 0;
+        budgetPolls = 0;
         final signal = _txDataSignal = Completer<void>();
         await signal.future;
         continue;
       }
+
       if (_rpcStatusAvailable && !_rpcSessionActive) {
-        // Bytes written before the firmware opens its RPC session are silently
-        // dropped on the device and desynchronize the protobuf framing — hold
-        // TX until the session reports active.
         final signal = _rpcActiveSignal = Completer<void>();
-        final became = await _awaitSignal(signal, const Duration(seconds: 5));
-        if (!became && isActive) {
-          LogService.log('[BLE] TX held: firmware RPC session not active yet');
+        if (await _awaitSignal(signal, _stallPoll)) {
+          sessionPolls = 0;
+          continue;
+        }
+        sessionPolls++;
+        if (sessionPolls == 1) {
+          LogService.log('[BLE] TX held: firmware RPC session not active');
+        }
+        if (sessionPolls >= _stallPollLimit && isActive) {
+          onTransportFault(
+            FlipperTransportError(
+              'Firmware RPC session did not become active within '
+              '${_stallPoll.inSeconds * _stallPollLimit}s with TX pending',
+            ),
+          );
+          break;
         }
         continue;
       }
-      await _sendBudgetCycle();
+      sessionPolls = 0;
+
+      if (_budget <= 0) {
+        final signal = _budgetSignal = Completer<void>();
+        if (await _awaitSignal(signal, _stallPoll)) {
+          budgetPolls = 0;
+          continue;
+        }
+        if (identical(_budgetSignal, signal)) _budgetSignal = null;
+        budgetPolls++;
+        if (budgetPolls == 1) {
+          // Reading the characteristic would return its stored value, not a
+          // fresh credit, and could overrun the firmware's 1024-byte buffer.
+          LogService.log('[BLE] TX held: waiting for overflow credit');
+        }
+        if (budgetPolls >= _stallPollLimit && isActive) {
+          onTransportFault(
+            FlipperTransportError(
+              'No flow-control credit for '
+              '${_stallPoll.inSeconds * _stallPollLimit}s with TX pending',
+            ),
+          );
+          break;
+        }
+        continue;
+      }
+      budgetPolls = 0;
+
+      await _drainBudgetCycle();
     }
     _senderRunning = false;
   }
 
-  /// Sends queued frames within one flow-control credit cycle. Never sends a
-  /// single byte beyond the credit the firmware granted.
-  Future<void> _sendBudgetCycle() async {
-    if (_budget <= 0) {
-      final signal = _budgetSignal = Completer<void>();
-      final granted = await _awaitSignal(signal, const Duration(seconds: 5));
-      if (!granted) {
-        if (identical(_budgetSignal, signal)) _budgetSignal = null;
-        // A characteristic read would return the stored value, not a fresh
-        // firmware credit; reusing it can overrun the 1024-byte RPC buffer.
-        if (isActive) {
-          LogService.log('[BLE] waiting for fresh overflow notification');
-        }
-      }
-      return;
-    }
-
+  // Sends queued frames within one credit cycle; never sends a single byte
+  // beyond the credit the firmware granted.
+  Future<void> _drainBudgetCycle() async {
     var cycleRemaining = _budget;
     final cycleGen = _budgetGen;
     _budget = 0;
@@ -630,29 +679,17 @@ abstract class _UniversalBleTransportBase extends _Transport {
       }
 
       final pending = _txQueue.first;
-      if (!_txWithResponse) {
-        // Pickup rendezvous: let the producer build the next frame while this
-        // one is being radioed out.
-        pending.complete();
-      }
-      final sendLength = [
-        pending.remainingLength,
-        cycleRemaining,
-        _bleMtuSize,
-      ].reduce((a, b) => a < b ? a : b);
+      final sendLength = pending.remainingLength < cycleRemaining
+          ? pending.remainingLength
+          : cycleRemaining;
       final sendEnd = pending.offset + sendLength;
-
-      Object? writeError;
       try {
         await _sendMessage(
           Uint8List.sublistView(pending.bytes, pending.offset, sendEnd),
         );
       } catch (e) {
-        writeError = e;
-      }
-      if (writeError != null) {
         if (isActive) {
-          onTransportFault(FlipperTransportError('BLE write failed: $writeError'));
+          onTransportFault(FlipperTransportError('BLE write failed: $e'));
         }
         return;
       }
@@ -661,20 +698,15 @@ abstract class _UniversalBleTransportBase extends _Transport {
       cycleRemaining -= sendLength;
       if (pending.offset == pending.bytes.length) {
         _txQueue.removeAt(0);
-        // WR mode resolves after the peer ACKed the last chunk (no-op for
-        // WWNR, whose completer fired at pickup).
         pending.complete();
       }
-      if (_budgetGen != cycleGen) {
-        // A fresh credit notification arrived while writing; it is
-        // authoritative and already accounts for everything sent so far.
-        return;
-      }
+      // A fresh credit notification is authoritative: it already accounts for
+      // everything sent so far, so the old cycle's remainder must be dropped.
+      if (_budgetGen != cycleGen) return;
     }
 
-    // Keep unused capacity for later frames (the firmware only re-grants
-    // after the whole credit is consumed). A newer notification must not be
-    // overwritten.
+    // The firmware re-grants only after the whole credit is consumed; keep the
+    // unused remainder for later frames.
     if (cycleRemaining > 0 && _budgetGen == cycleGen) {
       _budget = cycleRemaining;
     }
@@ -687,19 +719,30 @@ abstract class _UniversalBleTransportBase extends _Transport {
         throw StateError('BLE transport closed');
       }
       final chunkEnd = (offset + _bleMtuSize).clamp(0, data.length);
-      await _ops.write(
-        _device.device.deviceId,
-        _txSvcId,
-        _txCharId,
-        Uint8List.sublistView(data, offset, chunkEnd),
-        withoutResponse: !_txWithResponse,
-      );
+      try {
+        await _ops.write(
+          _device.device.deviceId,
+          _txSvcId,
+          _txCharId,
+          Uint8List.sublistView(data, offset, chunkEnd),
+          withoutResponse: !_txWithResponse,
+        );
+      } on TimeoutException {
+        // The platform callback can be lost after an acknowledged ATT write.
+        // Retrying is unsafe: the peripheral may already have consumed the
+        // bytes. Continue once; overflow control and the RPC ACK verify the
+        // stream without duplicating this chunk or dropping the BLE link.
+        if (!_txWithResponse) rethrow;
+        LogService.log(
+          '[BLE] write callback timed out; continuing without retry',
+        );
+      }
       offset = chunkEnd;
     }
   }
 
-  /// Waits for [signal] to fire, up to [timeout]. Returns whether it fired —
-  /// a timeout is a result, not an exception.
+  // True if the signal fired within [timeout]; a timeout is a result, not an
+  // exception.
   Future<bool> _awaitSignal(Completer<void> signal, Duration timeout) {
     final result = Completer<bool>();
     final timer = Timer(timeout, () {
@@ -734,8 +777,6 @@ abstract class _UniversalBleTransportBase extends _Transport {
     }
   }
 
-  // ── Shutdown ───────────────────────────────────────────────────────────────
-
   @override
   void onFaultExtra(Object error) {
     _releaseSenderSignals();
@@ -755,8 +796,29 @@ abstract class _UniversalBleTransportBase extends _Transport {
   Future<void> doClose() async {
     _releaseSenderSignals();
     _failAllPending(StateError('BLE transport closed'));
+    if (!identical(_connectionOwner, this)) {
+      LogService.log(
+        '[BLE] stale transport closed without platform disconnect '
+        '(newer transport owns ${_device.device.deviceId})',
+      );
+      _markBleDisconnected();
+      _clearBleCallbacks();
+      return;
+    }
     if (_link == _BleLinkState.disconnected) {
-      LogService.log('[BLE] already disconnected before close');
+      if (_platformConnectionEstablished) {
+        // Configured but never opened: the platform link exists and must be
+        // released.
+        try {
+          await _ops.disconnect(_device.device.deviceId);
+        } catch (e) {
+          LogService.log('[BLE] disconnect failed: $e');
+        }
+        _markBleDisconnected();
+        _clearBleCallbacks();
+        return;
+      }
+      _connectionOwner = null;
       _clearBleCallbacks();
       return;
     }
@@ -768,7 +830,6 @@ abstract class _UniversalBleTransportBase extends _Transport {
       _clearBleCallbacks();
       return;
     }
-    LogService.log('[BLE] close requested; disconnecting device');
     try {
       await _ops.disconnect(_device.device.deviceId);
     } catch (e) {
@@ -781,16 +842,22 @@ abstract class _UniversalBleTransportBase extends _Transport {
       disconnectSignal,
       const Duration(seconds: 5),
     );
-    if (!confirmed) {
-      LogService.log('[BLE] disconnect event timeout after close request');
-    }
+    LogService.log(
+      confirmed
+          ? '[BLE] disconnected'
+          : '[BLE] disconnect event not confirmed within 5s',
+    );
     _markBleDisconnected();
     _clearBleCallbacks();
   }
 
   void _markBleDisconnected() {
     _link = _BleLinkState.disconnected;
+    _platformConnectionEstablished = false;
     _rpcSessionActive = false;
+    if (identical(_connectionOwner, this)) {
+      _connectionOwner = null;
+    }
     final signal = _disconnectSignal;
     _disconnectSignal = null;
     _fireSignal(signal);

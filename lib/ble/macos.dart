@@ -1,7 +1,6 @@
 part of '../flipper_client.dart';
 
-// ── Native macOS BLE adapter (uses FlipperBlePlugin via MethodChannel) ───────
-
+// Native macOS BLE adapter (FlipperBlePlugin via MethodChannel).
 class _NativeMacosOps implements _BleOps {
   static const _mc = MethodChannel('com.qunleashed.flipper/ble');
   static const _ec = EventChannel('com.qunleashed.flipper/ble/events');
@@ -160,8 +159,6 @@ class _NativeMacosOps implements _BleOps {
   }
 }
 
-// ── macOS BLE platform ────────────────────────────────────────────────────────
-
 class _MacosBlePlatform extends _UniversalBlePlatformBase {
   _MacosBlePlatform();
 
@@ -196,22 +193,20 @@ class _MacosBlePlatform extends _UniversalBlePlatformBase {
   }
 }
 
-// ── macOS BLE transport ───────────────────────────────────────────────────────
-
 class _MacosBleTransport extends _UniversalBleTransportBase {
   _MacosBleTransport._(BleDiscoveredDevice device)
     : super(device, _NativeMacosOps());
 
   static Future<_MacosBleTransport> create(BleDiscoveredDevice device) async {
     final transport = _MacosBleTransport._(device);
+    // _configure releases the platform link itself if it fails.
     await transport._configure();
     // macOS auto-negotiates MTU. If the plugin reports the default payload,
-    // use the firmware-safe ATT ceiling while keeping the RPC chunk at 512.
+    // fall back to the stable payload cap (see _maxBleMtuSize).
     if (transport._bleMtuSize < 100) {
       transport._bleMtuSize = _UniversalBleTransportBase._maxBleMtuSize;
       LogService.log(
-        '[BLE] macOS: MTU not negotiated, using mtu='
-        '${transport._bleMtuSize}',
+        '[BLE] macOS: MTU not negotiated, using mtu=${transport._bleMtuSize}',
       );
     }
     return transport;
