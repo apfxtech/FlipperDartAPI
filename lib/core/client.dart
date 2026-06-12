@@ -91,6 +91,27 @@ class FlipperClient {
   // interleaved executeCli calls would corrupt each other's output.
   Future<void> _cliChain = Future.value();
 
+  // Storage activity tracking, maintained centrally in callRpcFrames /
+  // callRpcFramesMulti so every storage RPC is covered regardless of which
+  // API wrapper issued it. Only the heavy commands count — reads, writes and
+  // deletes, the ones that move real data over the link; list / stat / info
+  // are cheap display queries and neither hold `storageBusy` nor emit events.
+  // `storageMutations` fires only for commands that change SD-card contents
+  // (write, delete).
+  int _storageOpsInFlight = 0;
+  final _storageMutationCtrl = StreamController<void>.broadcast();
+
+  static const Set<Main_Content> _heavyStorageContent = {
+    Main_Content.storageWriteRequest,
+    Main_Content.storageReadRequest,
+    Main_Content.storageDeleteRequest,
+  };
+
+  static const Set<Main_Content> _mutatingStorageContent = {
+    Main_Content.storageWriteRequest,
+    Main_Content.storageDeleteRequest,
+  };
+
   Stream<List<FlipperDevice>> get devicesStream => _devicesCtrl.stream;
 
   Stream<FlipperConnectionState> get connectionStream => _connectionCtrl.stream;
@@ -108,6 +129,18 @@ class FlipperClient {
   Stream<Main> get notificationStream => _broadcastCtrl.stream;
 
   Stream<FlipperRpcException> get errorStream => _errorCtrl.stream;
+
+  /// True while a heavy storage RPC (read, write or delete — the ones that
+  /// move real data) is in flight. Pollers should stay quiet: a long transfer
+  /// owns the link, and anything queued behind it only times out. Cheap
+  /// display queries (list, stat, info) do not hold this flag.
+  bool get storageBusy => _storageOpsInFlight > 0;
+
+  /// Emits once per completed storage command that changes SD-card contents
+  /// (write, delete). Fires on completion regardless of outcome — a failed or
+  /// cancelled operation may still have changed the filesystem. Consumers
+  /// debounce and refresh storage info reactively.
+  Stream<void> get storageMutations => _storageMutationCtrl.stream;
 
   // USB hotplug events: native attach/detach broadcasts on Android, port-set
   // diffs on desktop. Listeners call refreshUsbOnly in response.
@@ -851,13 +884,26 @@ class FlipperClient {
       );
     });
 
+    final content = request.whichContent();
+    final trackStorage = _heavyStorageContent.contains(content);
+    if (trackStorage) _storageOpsInFlight++;
     try {
       return await pending.future;
     } finally {
       _pendingRpc.remove(commandId);
       _releaseTxGroup(commandId);
       pending.cancelTimeout();
+      if (trackStorage) {
+        _storageOpsInFlight--;
+        _notifyStorageMutation(content);
+      }
     }
+  }
+
+  void _notifyStorageMutation(Main_Content content) {
+    if (!_mutatingStorageContent.contains(content)) return;
+    if (_storageMutationCtrl.isClosed) return;
+    _storageMutationCtrl.add(null);
   }
 
   Future<List<Main>> callRpcFramesMulti(
@@ -873,6 +919,10 @@ class FlipperClient {
     _pendingRpc[commandId] = pending;
     var finalFrameSent = false;
     var timeoutArmed = false;
+    // The command's content becomes known with the first frame the body
+    // sends; storage tracking starts there and ends with the call.
+    var trackedContent = Main_Content.notSet;
+    var trackingStorage = false;
 
     void armOrRearmTimeout() {
       if (timeoutArmed) {
@@ -893,6 +943,13 @@ class FlipperClient {
 
     Future<void> sendFrame(Main frame) {
       frame.commandId = commandId;
+      if (trackedContent == Main_Content.notSet) {
+        trackedContent = frame.whichContent();
+        if (_heavyStorageContent.contains(trackedContent)) {
+          trackingStorage = true;
+          _storageOpsInFlight++;
+        }
+      }
       final sent = Completer<void>();
       final isFinal = !frame.hasNext;
       _enqueueRequest(
@@ -939,6 +996,10 @@ class FlipperClient {
       _pendingRpc.remove(commandId);
       _releaseTxGroup(commandId);
       pending.cancelTimeout();
+      if (trackingStorage) {
+        _storageOpsInFlight--;
+        _notifyStorageMutation(trackedContent);
+      }
     }
   }
 
@@ -1516,6 +1577,7 @@ class FlipperClient {
     await _errorCtrl.close();
     await _deviceInfoCompleteCtrl.close();
     await _deviceInfoWatchCtrl.close();
+    await _storageMutationCtrl.close();
   }
 
   void _setMode(

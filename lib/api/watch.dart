@@ -96,20 +96,25 @@ extension FlipperWatchApi on FlipperClient {
     }
     if (!alive()) return;
 
-    // Storage /ext — staggered so battery enters RPC queue first
+    // Storage /ext — staggered so battery enters RPC queue first. This is the
+    // only unconditional storage-info fetch; afterwards it refreshes purely
+    // reactively (see phase 2).
     await Future<void>.delayed(const Duration(seconds: 2));
     if (!alive()) return;
-    var extData = <String, String>{};
-    try {
-      final response = await storageInfo(
-        InfoRequest(path: '/ext/'),
-        priority: FlipperRequestPriority.background,
-      );
-      extData = _storageResponseToMap(response.single, 'storage.sdcard');
-      if (extData.isNotEmpty) emit(extData);
-    } catch (e) {
-      LogService.log('[watchInfo] storage /ext initial: $e');
+    Future<void> fetchExtInfo(String stage) async {
+      try {
+        final response = await storageInfo(
+          InfoRequest(path: '/ext/'),
+          priority: FlipperRequestPriority.background,
+        );
+        final extData = _storageResponseToMap(response.single, 'storage.sdcard');
+        if (extData.isNotEmpty) emit(extData);
+      } catch (e) {
+        LogService.log('[watchInfo] storage /ext $stage: $e');
+      }
     }
+
+    await fetchExtInfo('initial');
     if (!alive()) return;
 
     // Storage /int — slow (storageDu), fire-and-forget so periodic loop starts
@@ -131,57 +136,90 @@ extension FlipperWatchApi on FlipperClient {
       }
     }());
 
-    // Phase 2: periodic loop
+    // Phase 2: periodic battery poll + reactive storage refresh.
+    //
+    // Storage info is never polled on a timer after the phase-1 snapshot: it
+    // refreshes only in response to completed mutating storage operations
+    // (client.storageMutations), debounced and rate-limited:
+    //  - the refresh runs 1 s after the last completion, so a burst of
+    //    operations (e.g. write + delete + rename of a safe replace)
+    //    produces exactly one refresh;
+    //  - refreshes are at least 5 s apart;
+    //  - nothing is sent while another storage RPC is in flight — the timer
+    //    just re-checks later instead of queueing behind a long transfer.
+    const storageQuietDelay = Duration(seconds: 1);
+    const storageMinInterval = Duration(seconds: 5);
+    // (Stopwatch, not DateTime: the protobuf bindings shadow dart:core
+    // DateTime inside this library.)
+    final clock = Stopwatch()..start();
+    Duration? lastRefreshAt;
+    Timer? refreshTimer;
+
+    void scheduleStorageRefresh() {
+      if (!alive()) return;
+      var delay = storageQuietDelay;
+      final last = lastRefreshAt;
+      if (last != null) {
+        final untilAllowed = last + storageMinInterval - clock.elapsed;
+        if (untilAllowed > delay) delay = untilAllowed;
+      }
+      refreshTimer?.cancel();
+      refreshTimer = Timer(delay, () {
+        if (!alive()) return;
+        if (storageBusy || _mode != FlipperMode.rpc || cliExclusive) {
+          // The link is occupied; check again after another quiet window.
+          scheduleStorageRefresh();
+          return;
+        }
+        lastRefreshAt = clock.elapsed;
+        unawaited(fetchExtInfo('refresh'));
+      });
+    }
+
+    final mutationSub = storageMutations.listen(
+      (_) => scheduleStorageRefresh(),
+    );
 
     var tick = 0;
     const interval = Duration(seconds: 5);
 
-    while (alive()) {
-      await Future<void>.delayed(interval);
-      if (!alive()) break;
-      // A CLI session owns the transport: polling would only throw
-      // "RPC switch blocked" every tick and spam the log. Skip quietly and
-      // resume once the client is back in RPC mode.
-      if (_mode != FlipperMode.rpc || cliExclusive) continue;
-      tick++;
-
-      // Battery: partial every 5 s, full every 15 s
-      try {
-        final batch = await powerInfo(
-          priority: FlipperRequestPriority.background,
-        );
-        final all = {
-          for (final item in batch.items) 'power.${item.key}': item.value,
-        };
-        if (tick % 3 == 0) {
-          emit(all);
-        } else {
-          final partial = Map.fromEntries(
-            all.entries.where((e) => e.key.contains('current')),
-          );
-          if (partial.isNotEmpty) emit(partial);
-        }
-      } catch (e) {
-        LogService.log('[watchInfo] battery poll: $e');
+    try {
+      while (alive()) {
+        await Future<void>.delayed(interval);
         if (!alive()) break;
-      }
+        // A CLI session owns the transport: polling would only throw
+        // "RPC switch blocked" every tick and spam the log. Skip quietly and
+        // resume once the client is back in RPC mode.
+        if (_mode != FlipperMode.rpc || cliExclusive) continue;
+        // Frozen while storage operations run: a battery poll queued behind
+        // a long transfer would only time out and spam errors.
+        if (storageBusy) continue;
+        tick++;
 
-      // Storage /ext every 30 s, staggered 500 ms after battery
-      if (alive() && tick % 6 == 0) {
-        await Future<void>.delayed(const Duration(milliseconds: 500));
-        if (!alive()) break;
+        // Battery: partial every 5 s, full every 15 s
         try {
-          final response = await storageInfo(
-            InfoRequest(path: '/ext/'),
+          final batch = await powerInfo(
             priority: FlipperRequestPriority.background,
           );
-          extData = _storageResponseToMap(response.single, 'storage.sdcard');
-          if (extData.isNotEmpty) emit(extData);
+          final all = {
+            for (final item in batch.items) 'power.${item.key}': item.value,
+          };
+          if (tick % 3 == 0) {
+            emit(all);
+          } else {
+            final partial = Map.fromEntries(
+              all.entries.where((e) => e.key.contains('current')),
+            );
+            if (partial.isNotEmpty) emit(partial);
+          }
         } catch (e) {
-          LogService.log('[watchInfo] storage /ext poll: $e');
+          LogService.log('[watchInfo] battery poll: $e');
           if (!alive()) break;
         }
       }
+    } finally {
+      refreshTimer?.cancel();
+      await mutationSub.cancel();
     }
   }
 }
