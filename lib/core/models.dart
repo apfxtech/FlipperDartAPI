@@ -55,10 +55,17 @@ class FlipperConnectionState {
   /// instead of guessing from a bare disconnect.
   final Object? closeReason;
 
+  /// True on the disconnected event that precedes an automatic reconnect
+  /// attempt: the link dropped unexpectedly and the client is already
+  /// re-establishing it. UIs can show a soft "reconnecting" indicator instead
+  /// of the full disconnect flow.
+  final bool reconnecting;
+
   const FlipperConnectionState({
     required this.mode,
     required this.device,
     required this.connected,
     this.closeReason,
+    this.reconnecting = false,
   });
 }

@@ -55,6 +55,11 @@ class _PendingRpc {
   Duration? _watchdogTimeout;
   void Function()? _watchdogCallback;
 
+  // True once at least one frame of this command reached the transport. A
+  // started command has state on the firmware side and cannot survive a link
+  // drop; a never-started one replays safely on the next session.
+  bool started = false;
+
   _PendingRpc(this.commandId) {
     // Multi-frame requests may fail while their body is still being sent,
     // before the caller reaches `await future`; without this the error would
@@ -76,6 +81,7 @@ class _PendingRpc {
   }
 
   void armTimeout(Duration timeout, void Function() onTimeout) {
+    started = true;
     _watchdogTimeout = timeout;
     _watchdogCallback = onTimeout;
     _scheduleTimer();

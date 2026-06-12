@@ -257,8 +257,8 @@ extension FlipperStorageApi on FlipperClient {
       'rpcChunk=$rpcChunkSize',
     );
 
-    try {
-      await callRpcFramesMulti(
+    Future<void> upload() {
+      return callRpcFramesMulti(
         (sendFrame) async {
           var offset = 0;
           var frameIndex = 0;
@@ -286,10 +286,27 @@ extension FlipperStorageApi on FlipperClient {
         },
         timeout: timeout,
         priority: priority,
-      );
+      ).then((_) {});
+    }
+
+    try {
+      await upload();
     } catch (e) {
-      LogService.log('[Storage] write "$path" failed while awaiting ACK: $e');
-      rethrow;
+      if (!_isLinkDropError(e)) {
+        LogService.log('[Storage] write "$path" failed: $e');
+        rethrow;
+      }
+      // The link dropped mid-upload and the firmware lost the partial file.
+      // If the automatic reconnect restores the session, restart the upload
+      // exactly once — the firmware opens the file with CREATE_ALWAYS, so a
+      // restart from offset 0 is safe.
+      LogService.log('[Storage] write "$path" interrupted by link drop: $e');
+      final restored = await _waitForRpcSession(const Duration(seconds: 30));
+      if (!restored) {
+        rethrow;
+      }
+      LogService.log('[Storage] link restored, restarting write "$path"');
+      await upload();
     }
 
     onProgress?.call(1.0);

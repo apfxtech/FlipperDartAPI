@@ -11,6 +11,13 @@ class FlipperClient {
   // desynchronized and closed.
   static const int _maxRxParseErrorStreak = 3;
 
+  // Auto-reconnect oscillation guard: a restored session that lives at least
+  // this long is considered healthy and resets the quick-drop streak; after
+  // _maxQuickDropStreak consecutive short-lived sessions auto-reconnect stops
+  // until the next manual connect.
+  static const Duration _quickDropWindow = Duration(seconds: 30);
+  static const int _maxQuickDropStreak = 2;
+
   final _devicesCtrl = StreamController<List<FlipperDevice>>.broadcast();
   final _connectionCtrl = StreamController<FlipperConnectionState>.broadcast();
   final _modeCtrl = StreamController<FlipperMode>.broadcast();
@@ -51,6 +58,15 @@ class FlipperClient {
   bool _deviceInfoFetched = false;
   int _collectionGen = 0;
   int _rxParseErrorStreak = 0;
+
+  // Automatic single-shot reconnect after an unexpected link drop. One
+  // attempt per fault, serialized with every other lifecycle operation, with
+  // an oscillation guard — it can never turn into a retry loop.
+  // (Stopwatch, not DateTime: the protobuf bindings shadow dart:core DateTime
+  // inside this library.)
+  bool autoReconnect = true;
+  final Stopwatch _sessionUptime = Stopwatch();
+  int _quickDropStreak = 0;
 
   Completer<void>? _queueSignal;
   int? _workerGen;
@@ -243,16 +259,142 @@ class FlipperClient {
     return result;
   }
 
-  // Teardown for faults reported by callbacks. Bound to the generation that
+  // Recovery for faults reported by callbacks. Bound to the generation that
   // faulted: by the time the chain reaches it, a newer session may already be
-  // up and must not be killed.
-  void _scheduleTeardown(int gen, Object reason) {
+  // up and must not be touched. Reconnects in place when allowed, otherwise
+  // tears down with the original reason.
+  void _scheduleFaultRecovery(int gen, Object reason) {
     unawaited(
       _serialized(() async {
         if (gen != _sessionGen) return;
-        await _teardownLocked(reason);
+        final device = _connectedDevice;
+        if (!autoReconnect || device == null || !_mayAutoReconnect()) {
+          await _teardownLocked(reason);
+          return;
+        }
+        await _reconnectLocked(device, reason);
       }),
     );
+  }
+
+  bool _mayAutoReconnect() {
+    if (_sessionUptime.isRunning && _sessionUptime.elapsed >= _quickDropWindow) {
+      _quickDropStreak = 0;
+    }
+    if (_quickDropStreak >= _maxQuickDropStreak) {
+      // Two short-lived sessions in a row: the environment or device is not
+      // ready, stop interfering until the user reconnects manually.
+      _quickDropStreak = 0;
+      return false;
+    }
+    _quickDropStreak++;
+    return true;
+  }
+
+  // In-place reconnect to the same device. Keeps the device identity, the
+  // device-info cache and every queued request that never started
+  // transmitting; fails only commands whose firmware-side state died with the
+  // link. Exactly one connect attempt — on failure the session ends with the
+  // original fault reason.
+  Future<void> _reconnectLocked(FlipperDevice device, Object reason) async {
+    LogService.log(
+      '[FlipperClient] link lost: $reason; reconnecting to ${device.name}',
+    );
+    _sessionGen++;
+
+    final transport = _transport;
+    final sub = _transportSub;
+    _transport = null;
+    _transportSub = null;
+    _switchToRpcFuture = null;
+    _frameBuffer.clear();
+    _rxParseErrorStreak = 0;
+
+    _failStartedRequests(
+      reason is Exception ? reason : StateError('Disconnected: $reason'),
+    );
+    _setMode(
+      FlipperMode.disconnected,
+      closeReason: reason,
+      reconnecting: true,
+    );
+    _signalWorker();
+
+    if (sub != null) await sub.cancel();
+    if (transport != null) await transport.close();
+
+    try {
+      await _establishLocked(device);
+    } catch (error) {
+      LogService.log('[FlipperClient] reconnect failed: $error');
+      await _teardownLocked(reason);
+      // The mode is already `disconnected`, so _setMode stayed silent; emit
+      // the final (non-reconnecting) state explicitly so listeners leave the
+      // "reconnecting" presentation.
+      if (!_connectionCtrl.isClosed) {
+        _connectionCtrl.add(
+          FlipperConnectionState(
+            mode: FlipperMode.disconnected,
+            device: null,
+            connected: false,
+            closeReason: reason,
+          ),
+        );
+      }
+      return;
+    }
+    LogService.log('[FlipperClient] reconnected to ${device.name}');
+  }
+
+  // True for failures caused by the link dying (as opposed to an RPC-level
+  // error from the firmware): these are the ones an automatic reconnect can
+  // make whole again.
+  bool _isLinkDropError(Object error) {
+    if (error is FlipperTransportError) return true;
+    if (error is StateError) {
+      final message = error.message;
+      return message.startsWith('Disconnected') ||
+          message.startsWith('Request dropped') ||
+          message.contains('Transport closed') ||
+          message.contains('No active transport');
+    }
+    return false;
+  }
+
+  // Waits until the client is back in RPC mode (e.g. after an automatic
+  // reconnect), up to [timeout]. A timeout is a result, not an exception.
+  Future<bool> _waitForRpcSession(Duration timeout) async {
+    if (_mode == FlipperMode.rpc) return true;
+    final restored = Completer<bool>();
+    final timer = Timer(timeout, () {
+      if (!restored.isCompleted) restored.complete(false);
+    });
+    final sub = modeStream.listen((mode) {
+      if (mode == FlipperMode.rpc && !restored.isCompleted) {
+        restored.complete(true);
+      }
+    });
+    if (_mode == FlipperMode.rpc && !restored.isCompleted) {
+      restored.complete(true);
+    }
+    final result = await restored.future;
+    timer.cancel();
+    await sub.cancel();
+    return result;
+  }
+
+  // Fails commands that already (partially) reached the wire — their
+  // firmware-side state died with the link. Requests still waiting in the
+  // queue replay transparently on the restored session.
+  void _failStartedRequests(Object error) {
+    _activeRequest = null;
+    final startedIds = <int>[
+      for (final entry in _pendingRpc.entries)
+        if (entry.value.started) entry.key,
+    ];
+    for (final id in startedIds) {
+      _failPendingById(id, error);
+    }
   }
 
   Future<FlipperDevice> _connectLocked(
@@ -260,6 +402,16 @@ class FlipperClient {
     bool autoRpc = true,
   }) async {
     await _teardownLocked('replaced by connect to ${device.name}');
+    return _establishLocked(device, autoRpc: autoRpc);
+  }
+
+  // Opens a transport and commits the session. Callers are responsible for
+  // detaching any previous session first: _connectLocked tears it down fully,
+  // _reconnectLocked keeps the queue and the device-info cache alive.
+  Future<FlipperDevice> _establishLocked(
+    FlipperDevice device, {
+    bool autoRpc = true,
+  }) async {
     // A running scan competes with the connection for the radio (on macOS a
     // second CBCentralManager halves effective throughput).
     await stopScan();
@@ -296,13 +448,16 @@ class FlipperClient {
         // events on bytesStream; defensive guard against a misbehaving
         // backend.
         LogService.log('[FlipperClient] transport stream error: $error');
-        _scheduleTeardown(gen, error);
+        _scheduleFaultRecovery(gen, error);
       },
       onDone: () => _onTransportClosed(transport!),
     );
 
     _setMode(transport.initialMode);
     _startWorker(gen);
+    _sessionUptime
+      ..reset()
+      ..start();
     LogService.log('[FlipperClient] connected to ${device.name}');
     if (autoRpc && transport.supportsCli) {
       unawaited(
@@ -320,9 +475,18 @@ class FlipperClient {
   Future<void> _teardownLocked(Object reason) async {
     _sessionGen++;
     final transport = _transport;
-    if (transport == null && _mode == FlipperMode.disconnected) {
+    if (transport == null &&
+        _connectedDevice == null &&
+        _mode == FlipperMode.disconnected &&
+        _requestQueue.isEmpty &&
+        _pendingRpc.isEmpty &&
+        _deviceInfoCache.isEmpty) {
       return;
     }
+    _sessionUptime
+      ..stop()
+      ..reset();
+    _quickDropStreak = 0;
 
     final sub = _transportSub;
     _transport = null;
@@ -354,7 +518,7 @@ class FlipperClient {
         ? reason
         : FlipperTransportError('$reason; active ${active.describe()}');
     LogService.log('[FlipperClient] transport closed: $detailedReason');
-    _scheduleTeardown(_sessionGen, detailedReason);
+    _scheduleFaultRecovery(_sessionGen, detailedReason);
   }
 
   void _failAllRequests(Object error) {
@@ -1012,7 +1176,7 @@ class FlipperClient {
         // The firmware lost protobuf framing on its RX side; it closes the
         // RPC session right after sending this (and restarts its BLE stack).
         LogService.log('[RPC] firmware reported ERROR_DECODE; session is dead');
-        _scheduleTeardown(
+        _scheduleFaultRecovery(
           _sessionGen,
           FlipperTransportError(
             'Firmware reported a protobuf decode error and closed the '
@@ -1065,7 +1229,7 @@ class FlipperClient {
     // The inbound stream is desynchronized beyond recovery; close the session
     // with the real reason. Poking the firmware's reset characteristic would
     // restart its whole BLE stack, turning one bad frame into a link drop.
-    _scheduleTeardown(
+    _scheduleFaultRecovery(
       _sessionGen,
       FlipperTransportError('RPC byte stream desynchronized: $error'),
     );
@@ -1169,7 +1333,11 @@ class FlipperClient {
     await _deviceInfoWatchCtrl.close();
   }
 
-  void _setMode(FlipperMode mode, {Object? closeReason}) {
+  void _setMode(
+    FlipperMode mode, {
+    Object? closeReason,
+    bool reconnecting = false,
+  }) {
     if (_mode == mode) return;
     _mode = mode;
     _modeCtrl.add(mode);
@@ -1179,6 +1347,7 @@ class FlipperClient {
         device: _connectedDevice,
         connected: mode != FlipperMode.disconnected,
         closeReason: closeReason,
+        reconnecting: reconnecting,
       ),
     );
   }
@@ -1189,18 +1358,24 @@ class FlipperClient {
   void _ensureDeviceInfoFetch() {
     if (_deviceInfoFetched || _deviceInfoFetch != null) return;
     if (_transport == null) return;
-    _deviceInfoFetch = _fetchDeviceInfoOnce(_sessionGen);
+    late final Future<void> fetch;
+    fetch = _fetchDeviceInfoOnce().whenComplete(() {
+      if (identical(_deviceInfoFetch, fetch)) _deviceInfoFetch = null;
+    });
+    _deviceInfoFetch = fetch;
   }
 
-  Future<void> _fetchDeviceInfoOnce(int gen) async {
+  Future<void> _fetchDeviceInfoOnce() async {
+    // Device identity, not session generation: the cache stays valid across an
+    // automatic reconnect to the same device, but never leaks to another one.
+    final device = _connectedDevice;
     try {
       await deviceInfo(priority: FlipperRequestPriority.foreground);
     } catch (error) {
       LogService.log('[FlipperClient] device info fetch failed: $error');
-      if (gen == _sessionGen) _deviceInfoFetch = null;
       return;
     }
-    if (gen != _sessionGen) return;
+    if (!identical(_connectedDevice, device)) return;
     _deviceInfoFetched = true;
     final snapshot = deviceInfoCache;
     if (!_deviceInfoWatchCtrl.isClosed) {
