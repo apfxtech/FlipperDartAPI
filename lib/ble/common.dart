@@ -739,7 +739,11 @@ abstract class _UniversalBleTransportBase extends _Transport {
       pending.offset = sendEnd;
       cycleRemaining -= sendLength;
       if (pending.offset == pending.bytes.length) {
-        _txQueue.removeAt(0);
+        // _failAllPending (called from onFaultExtra during the await above) may
+        // have cleared _txQueue; guard before removeAt to avoid RangeError.
+        if (_txQueue.isNotEmpty && identical(pending, _txQueue.first)) {
+          _txQueue.removeAt(0);
+        }
         pending.complete();
       }
       // A fresh credit notification is authoritative: it already accounts for
@@ -799,8 +803,6 @@ abstract class _UniversalBleTransportBase extends _Transport {
     }
   }
 
-  // True if the signal fired within [timeout]; a timeout is a result, not an
-  // exception.
   Future<bool> _awaitSignal(Completer<void> signal, Duration timeout) {
     final result = Completer<bool>();
     final timer = Timer(timeout, () {
@@ -865,8 +867,6 @@ abstract class _UniversalBleTransportBase extends _Transport {
     }
     if (_link == _BleLinkState.disconnected) {
       if (_platformConnectionEstablished) {
-        // Configured but never opened: the platform link exists and must be
-        // released.
         try {
           await _ops.disconnect(_device.device.deviceId);
         } catch (e) {

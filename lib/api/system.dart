@@ -94,6 +94,18 @@ extension FlipperSystemApi on FlipperClient {
     );
   }
 
+  Future<void> rebootAndDisconnect(RebootRequest request) async {
+    unawaited(
+      callRpcFrames(
+        Main(systemRebootRequest: request),
+        timeout: const Duration(seconds: 5),
+        priority: FlipperRequestPriority.rightNow,
+      ).catchError((_) => <Main>[]),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    await disconnect();
+  }
+
   Future<List<Main>> update(
     UpdateRequest request, {
     Duration timeout = const Duration(seconds: 8),
@@ -104,6 +116,18 @@ extension FlipperSystemApi on FlipperClient {
       timeout: timeout,
       priority: priority,
     );
+  }
+
+  Future<void> updateAndDisconnect(UpdateRequest request) async {
+    unawaited(
+      callRpcFrames(
+        Main(systemUpdateRequest: request),
+        timeout: const Duration(seconds: 5),
+        priority: FlipperRequestPriority.rightNow,
+      ).catchError((_) => <Main>[]),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    await disconnect();
   }
 
   Future<FlipperRpcBatch<UpdateResponse>> updateStatus({
