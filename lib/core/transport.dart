@@ -9,6 +9,13 @@ class FlipperTransportError implements Exception {
   String toString() => message;
 }
 
+// Logical transport lifecycle (the byte pipe), distinct from the BLE platform
+// link state `_BleLinkState` one layer down: `active` means writes/reads are
+// allowed, regardless of how the underlying link is being established or torn
+// down. Invariant across the layers: once this reaches `closed` the BLE
+// subclass is always `_BleLinkState.disconnected` (onTransportFault ->
+// onFaultExtra -> _markBleDisconnected), so `isActive` and a live platform link
+// never disagree.
 enum _TransportLifecycle { active, closing, closed }
 
 // Byte transport (BLE / USB serial). Writes are serialized: rawWrite never
@@ -122,4 +129,12 @@ abstract class _Transport {
   }
 
   Future<void> doClose();
+}
+
+// Completes a one-shot wake-up signal if it is armed and not already fired.
+// Shared by the client and the BLE transport, which both juggle several
+// `Completer<void>?` signals (queue, scan-phase, budget, rpc-active, disconnect,
+// setup-guard) with identical fire semantics.
+void _fireOnce(Completer<void>? signal) {
+  if (signal != null && !signal.isCompleted) signal.complete();
 }

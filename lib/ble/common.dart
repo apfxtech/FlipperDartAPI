@@ -311,7 +311,6 @@ abstract class _UniversalBleTransportBase extends _Transport {
   int _writeTimeoutStreak = 0;
   static const int _maxWriteTimeoutStreak = 2;
   _BleLinkState _link = _BleLinkState.disconnected;
-  bool _platformConnectionEstablished = false;
 
   _UniversalBleTransportBase(this._device, this._ops);
 
@@ -345,7 +344,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
         'try forgetting the pairing on both sides)',
       );
     }
-    _platformConnectionEstablished = true;
+    _link = _BleLinkState.established;
     if (connectAttempt != _connectAttemptGen) {
       // A newer attempt owns the platform link now; do not touch it.
       throw StateError('BLE connection attempt superseded');
@@ -358,7 +357,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
       // connection.
       if (identical(_connectionOwner, this)) {
         _connectionOwner = null;
-        _platformConnectionEstablished = false;
+        _link = _BleLinkState.disconnected;
         unawaited(
           _ops.disconnect(deviceId).catchError((Object e) {
             LogService.log('[BLE] cleanup disconnect failed: $e');
@@ -642,7 +641,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
     }
     final signal = _budgetSignal;
     _budgetSignal = null;
-    _fireSignal(signal);
+    _fireOnce(signal);
   }
 
   void _applyRpcStatusValue(List<int> value) {
@@ -653,7 +652,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
     if (active) {
       final signal = _rpcActiveSignal;
       _rpcActiveSignal = null;
-      _fireSignal(signal);
+      _fireOnce(signal);
       return;
     }
     if (!isActive || _link != _BleLinkState.connected) return;
@@ -677,7 +676,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
     _txQueue.add(pending);
     final signal = _txDataSignal;
     _txDataSignal = null;
-    _fireSignal(signal);
+    _fireOnce(signal);
     _startSender();
     return pending.future;
   }
@@ -866,17 +865,13 @@ abstract class _UniversalBleTransportBase extends _Transport {
     return result.future;
   }
 
-  void _fireSignal(Completer<void>? signal) {
-    if (signal != null && !signal.isCompleted) signal.complete();
-  }
-
   void _releaseSenderSignals() {
     final signals = [_budgetSignal, _txDataSignal, _rpcActiveSignal];
     _budgetSignal = null;
     _txDataSignal = null;
     _rpcActiveSignal = null;
     for (final signal in signals) {
-      _fireSignal(signal);
+      _fireOnce(signal);
     }
   }
 
@@ -890,7 +885,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
 
   @override
   void onFaultExtra(Object error) {
-    _fireSignal(_setupGuard);
+    _fireOnce(_setupGuard);
     _releaseSenderSignals();
     _failAllPending(error);
     _markBleDisconnected();
@@ -908,7 +903,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
   Future<void> doClose() async {
     // A close() racing an in-flight open() (e.g. a superseded attempt) must
     // unblock its setup awaits too, not just fault-driven teardown.
-    _fireSignal(_setupGuard);
+    _fireOnce(_setupGuard);
     _releaseSenderSignals();
     _failAllPending(StateError('BLE transport closed'));
     if (!identical(_connectionOwner, this)) {
@@ -921,17 +916,22 @@ abstract class _UniversalBleTransportBase extends _Transport {
       return;
     }
     if (_link == _BleLinkState.disconnected) {
-      if (_platformConnectionEstablished) {
-        try {
-          await _ops.disconnect(_device.device.deviceId);
-        } catch (e) {
-          LogService.log('[BLE] disconnect failed: $e');
-        }
-        _markBleDisconnected();
-        _clearBleCallbacks();
-        return;
-      }
+      // Never reached the platform, or already fully torn down by a fault:
+      // nothing to release.
       _connectionOwner = null;
+      _clearBleCallbacks();
+      return;
+    }
+    if (_link == _BleLinkState.established) {
+      // Platform link is up but the GATT session never finished opening (or
+      // open() failed mid-setup): release it without the graceful confirmation
+      // wait — there is no live session to drain.
+      try {
+        await _ops.disconnect(_device.device.deviceId);
+      } catch (e) {
+        LogService.log('[BLE] disconnect failed: $e');
+      }
+      _markBleDisconnected();
       _clearBleCallbacks();
       return;
     }
@@ -966,14 +966,13 @@ abstract class _UniversalBleTransportBase extends _Transport {
 
   void _markBleDisconnected() {
     _link = _BleLinkState.disconnected;
-    _platformConnectionEstablished = false;
     _rpcSessionActive = false;
     if (identical(_connectionOwner, this)) {
       _connectionOwner = null;
     }
     final signal = _disconnectSignal;
     _disconnectSignal = null;
-    _fireSignal(signal);
+    _fireOnce(signal);
   }
 
   void _clearBleCallbacks() {
@@ -985,7 +984,23 @@ abstract class _UniversalBleTransportBase extends _Transport {
   }
 }
 
-enum _BleLinkState { connected, disconnecting, disconnected }
+// Ordered platform-link (GAP) lifecycle, the single source of truth for "how
+// alive is the BLE link". States advance monotonically:
+//   disconnected -> established -> connected -> disconnecting -> disconnected
+//   * established  : platform connect() succeeded, GATT session setup (open())
+//                    not finished yet — what the old `_platformConnection
+//                    Established` bool tracked. Folding that bool in here
+//                    removes a second field that had to be hand-synced with
+//                    `_link` on every disconnect path.
+//   * connected    : subscriptions are up, the RPC session is usable.
+//   * disconnecting: close() is draining the link.
+//
+// This is a *different layer* from `_Transport._lifecycle` (active/closing/
+// closed), which tracks the logical transport, not the platform link. Invariant
+// the two layers must preserve together: a faulted/closed transport is always
+// `disconnected` here (onFaultExtra/doClose -> _markBleDisconnected), and the
+// transport never reports `isActive` while `_link == disconnected`.
+enum _BleLinkState { disconnected, established, connected, disconnecting }
 
 class _BlePendingSend {
   _BlePendingSend(this.bytes);

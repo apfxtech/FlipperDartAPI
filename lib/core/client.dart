@@ -84,13 +84,16 @@ class FlipperClient {
 
   int _nextCommandId = 1;
   bool _scanning = false;
-  // True from the moment a BLE connect starts until its transport is committed
-  // (or the attempt fails). Scanning competes with the connecting radio — on
-  // macOS the scan runs on a *second* CBCentralManager (universal_ble) while
-  // the link runs on the native plugin, and the contention provokes the very
-  // "connection timed out unexpectedly" drops seen during setup — so scanning
-  // is refused for the whole connect window, not just once a session is live.
-  bool _bleConnecting = false;
+  // Coarse connection lifecycle and the single home for the `connecting`
+  // phase that neither `_transport` (still null until the session is committed)
+  // nor `_mode` (reads `disconnected` throughout connect) can express.
+  // `connected` is kept in lockstep with `_transport != null`, so `isConnected`
+  // derives from it. Used to refuse scans for the whole connect window:
+  // scanning competes with the connecting radio — on macOS the scan runs on a
+  // *second* CBCentralManager (universal_ble) while the link runs on the native
+  // plugin, and the contention provokes the very "connection timed out
+  // unexpectedly" drops seen during setup.
+  _LinkPhase _linkPhase = _LinkPhase.disconnected;
   Completer<void>? _scanPhaseInterrupt;
 
   // Devices-stream throttle: scan results arrive per advertising packet
@@ -210,9 +213,23 @@ class FlipperClient {
 
   FlipperMode get mode => _mode;
 
-  bool get isConnected => _transport != null;
+  bool get isConnected => _linkPhase == _LinkPhase.connected;
 
   bool get isScanning => _scanning;
+
+  // Scanning is refused while connecting (the radio is busy establishing the
+  // link) and while a BLE session is live; a USB session leaves the BLE radio
+  // free.
+  bool get _scanBlocked {
+    switch (_linkPhase) {
+      case _LinkPhase.disconnected:
+        return false;
+      case _LinkPhase.connecting:
+        return true;
+      case _LinkPhase.connected:
+        return _connectedDevice?.isBle ?? false;
+    }
+  }
 
   int nextCommandId() {
     do {
@@ -254,13 +271,13 @@ class FlipperClient {
     _scanning = true;
 
     try {
-      // Scanning competes with an active BLE link for the radio (on macOS a
-      // second CBCentralManager halves effective throughput and provokes
-      // drops); USB sessions are unaffected.
-      if (_bleConnecting ||
-          (_transport != null && (_connectedDevice?.isBle ?? false))) {
+      // Scanning competes with the radio (on macOS a second CBCentralManager
+      // halves effective throughput and provokes drops). It is refused for the
+      // whole connect window, and while a BLE link is live; a USB session
+      // leaves the BLE radio free, so scanning stays allowed there.
+      if (_scanBlocked) {
         LogService.log(
-          '[BLE] scan skipped: a BLE connection is active or in progress',
+          '[BLE] scan skipped: a connection is active or in progress',
         );
         return;
       }
@@ -320,7 +337,7 @@ class FlipperClient {
   void _interruptScanPhase() {
     final interrupt = _scanPhaseInterrupt;
     _scanPhaseInterrupt = null;
-    if (interrupt != null && !interrupt.isCompleted) interrupt.complete();
+    _fireOnce(interrupt);
   }
 
   Future<FlipperDevice> connectById(String id, {FlipperLink? link}) async {
@@ -403,6 +420,10 @@ class FlipperClient {
     final transport = _transport;
     final sub = _transportSub;
     _transport = null;
+    // The link is down and about to be re-established; keep scans blocked and
+    // isConnected false through the settle + re-open window. _establishLocked
+    // re-affirms `connecting` and advances to `connected` on success.
+    _linkPhase = _LinkPhase.connecting;
     _transportSub = null;
     _switchToRpcFuture = null;
     _frameBuffer.clear();
@@ -539,10 +560,10 @@ class FlipperClient {
     await stopScan();
 
     final gen = ++_sessionGen;
-    // Refuse scans for the whole connect window (see _bleConnecting). Cleared
-    // at every exit: failure, supersession, and right after the transport is
-    // committed (where the live-session guard takes over).
-    _bleConnecting = device.isBle;
+    // Enter the `connecting` phase for the whole connect window. It returns to
+    // `disconnected` on failure/supersession, or advances to `connected` the
+    // moment the transport is committed (kept in lockstep with `_transport`).
+    _linkPhase = _LinkPhase.connecting;
     LogService.log(
       '[FlipperClient] connecting to ${device.name} '
       '(${device.link.name}:${device.id})',
@@ -552,7 +573,7 @@ class FlipperClient {
       transport = await _openTransport(device);
       await transport.open();
     } catch (error) {
-      _bleConnecting = false;
+      _linkPhase = _LinkPhase.disconnected;
       LogService.log(
         '[FlipperClient] connect failed '
         'device=${device.name} link=${device.link.name}: $error',
@@ -562,13 +583,13 @@ class FlipperClient {
     }
 
     if (gen != _sessionGen) {
-      _bleConnecting = false;
+      _linkPhase = _LinkPhase.disconnected;
       await transport.close();
       throw StateError('Connection attempt superseded');
     }
 
     _transport = transport;
-    _bleConnecting = false;
+    _linkPhase = _LinkPhase.connected;
     _connectedDevice = device;
     _transportSub = transport.bytesStream.listen(
       _onTransportBytes,
@@ -619,6 +640,7 @@ class FlipperClient {
 
     final sub = _transportSub;
     _transport = null;
+    _linkPhase = _LinkPhase.disconnected;
     _transportSub = null;
     _connectedDevice = null;
     _switchToRpcFuture = null;
@@ -1153,7 +1175,7 @@ class FlipperClient {
   void _signalWorker() {
     final signal = _queueSignal;
     _queueSignal = null;
-    if (signal != null && !signal.isCompleted) signal.complete();
+    _fireOnce(signal);
   }
 
   void _startWorker(int gen) {
@@ -1690,3 +1712,8 @@ class FlipperClient {
     }
   }
 }
+
+// Coarse client-side connection lifecycle. `connecting` covers the whole
+// connect window (transport not yet committed); `connected` mirrors
+// `_transport != null`. See FlipperClient._linkPhase.
+enum _LinkPhase { disconnected, connecting, connected }
