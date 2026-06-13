@@ -4,3 +4,4 @@ build/
 pubspec.lock
 tools/protoc/
 tools/protoc.zip
+.DS_Store
