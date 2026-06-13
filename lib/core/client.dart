@@ -95,6 +95,12 @@ class FlipperClient {
   // unexpectedly" drops seen during setup.
   _LinkPhase _linkPhase = _LinkPhase.disconnected;
   Completer<void>? _scanPhaseInterrupt;
+  // A room can hold several Flippers. Finding the first one does not end the
+  // scan immediately: it starts this grace window, during which the scan keeps
+  // running so additional units can still surface, before the phase is cut
+  // short. Still capped by the caller's overall scan timeout.
+  static const Duration _scanGraceWindow = Duration(seconds: 5);
+  Timer? _scanGraceTimer;
 
   // Devices-stream throttle: scan results arrive per advertising packet
   // (tens per second); listeners get at most one event per window plus a
@@ -301,7 +307,7 @@ class FlipperClient {
           );
         }
         _rememberDevice(_fromDiscovered(discovered));
-        if (_hasFilteredBleDevice()) _interruptScanPhase();
+        if (_hasFilteredBleDevice()) _armScanGrace();
       };
 
       // Single phase scanning every advertising device: Flipper identification
@@ -316,6 +322,8 @@ class FlipperClient {
           _scanPhaseInterrupt = null;
         }
       } finally {
+        _scanGraceTimer?.cancel();
+        _scanGraceTimer = null;
         await uble.UniversalBle.stopScan();
         uble.UniversalBle.onScanResult = null;
       }
@@ -334,7 +342,22 @@ class FlipperClient {
     _emitDevices(immediate: true);
   }
 
+  // Starts the post-discovery grace window the first time a Flipper appears in
+  // the current scan phase; later results don't reset it, so the window is "5s
+  // after the first unit", not "after the last". A no-op once running, after
+  // the phase ended, or with no active phase.
+  void _armScanGrace() {
+    if (_scanGraceTimer != null || _scanPhaseInterrupt == null) return;
+    LogService.log(
+      '[BLE] Flipper found; scanning '
+      '${_scanGraceWindow.inSeconds}s more for additional units',
+    );
+    _scanGraceTimer = Timer(_scanGraceWindow, _interruptScanPhase);
+  }
+
   void _interruptScanPhase() {
+    _scanGraceTimer?.cancel();
+    _scanGraceTimer = null;
     final interrupt = _scanPhaseInterrupt;
     _scanPhaseInterrupt = null;
     _fireOnce(interrupt);
