@@ -61,11 +61,19 @@ class FlipperConnectionState {
   /// of the full disconnect flow.
   final bool reconnecting;
 
+  /// True while a connection attempt is in flight (the radio is busy
+  /// establishing the link) and no session is committed yet. [device] is the
+  /// target being connected to. UIs can surface this as a "connecting…" row
+  /// with a cancel action — a stuck attempt is the only state that holds the
+  /// radio and blocks scanning, so being able to abort it from here matters.
+  final bool connecting;
+
   const FlipperConnectionState({
     required this.mode,
     required this.device,
     required this.connected,
     this.closeReason,
     this.reconnecting = false,
+    this.connecting = false,
   });
 }

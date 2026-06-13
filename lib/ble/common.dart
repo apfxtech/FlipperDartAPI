@@ -266,6 +266,11 @@ abstract class _UniversalBleTransportBase extends _Transport {
   static _UniversalBleTransportBase? _connectionOwner;
   static _UniversalBleTransportBase? _activeTransport;
 
+  // Aborts whatever platform connect is currently in flight, if any. Lets a
+  // user-initiated disconnect during the connect window unwind the attempt
+  // immediately instead of waiting out _connectTimeout.
+  static void abortPendingConnect() => _connectionOwner?._abortConnect();
+
   final BleDiscoveredDevice _device;
   final _BleOps _ops;
 
@@ -301,6 +306,10 @@ abstract class _UniversalBleTransportBase extends _Transport {
   Completer<void>? _rpcActiveSignal;
 
   Completer<void>? _disconnectSignal;
+  // Completes when the user aborts an in-flight connect (see abortPendingConnect)
+  // so the platform connect await stops immediately instead of waiting out
+  // _connectTimeout. Live only for the duration of the connect await.
+  Completer<void>? _connectAbort;
   // Completed the instant the link drops (or the transport is closed) while
   // open()/_subscribeRpcStatus are still setting up GATT, so every setup await
   // aborts immediately instead of each waiting out its own multi-second
@@ -312,23 +321,68 @@ abstract class _UniversalBleTransportBase extends _Transport {
   static const int _maxWriteTimeoutStreak = 2;
   _BleLinkState _link = _BleLinkState.disconnected;
 
+  // Elapsed-time markers for precise disconnect diagnostics: how long the link
+  // survived after the platform reported connected, and after the RPC session
+  // (GATT setup) finished opening. A drop a few seconds after either is the
+  // signature of a link-layer problem (stale bond / supervision timeout), not
+  // anything the RPC layer did.
+  final Stopwatch _platformConnectAt = Stopwatch();
+  final Stopwatch _sessionOpenAt = Stopwatch();
+  int _bytesWrittenSinceOpen = 0;
+
   _UniversalBleTransportBase(this._device, this._ops);
 
   // Platform hook that runs after all subscriptions are in place
   // (macOS: connection-parameter settle).
   Future<void> _openExtra() async {}
 
+  // Aborts this transport's in-flight platform connect: wakes the connect race
+  // in _configure and tells the platform to stop the pending connection so
+  // CoreBluetooth/BlueZ does not keep it pending in the background.
+  void _abortConnect() {
+    final abort = _connectAbort;
+    if (abort != null && !abort.isCompleted) abort.complete();
+    unawaited(
+      _ops.disconnect(_device.device.deviceId).catchError((Object e) {
+        LogService.log('[BLE] abort-connect cancel failed: $e');
+      }),
+    );
+  }
+
   Future<void> _configure() async {
     final deviceId = _device.device.deviceId;
     final connectAttempt = ++_connectAttemptGen;
     _connectionOwner = this;
     var connectTimedOut = false;
-    await _ops.connect(deviceId).timeout(
+    var aborted = false;
+    final abort = _connectAbort = Completer<void>();
+    final connectFuture = _ops.connect(deviceId).timeout(
       _connectTimeout,
       onTimeout: () {
         connectTimedOut = true;
       },
     );
+    // If the abort wins the race, the connect future is left to settle on its
+    // own (_abortConnect already cancelled it on the platform side); swallow its
+    // late outcome so it does not surface as an unhandled async error.
+    unawaited(connectFuture.catchError((_) {}));
+    try {
+      // Race the platform connect against a user abort: whichever resolves
+      // first ends the wait.
+      await Future.any<void>([
+        connectFuture,
+        abort.future.then((_) => aborted = true),
+      ]);
+    } finally {
+      if (identical(_connectAbort, abort)) _connectAbort = null;
+    }
+    if (aborted) {
+      if (connectAttempt == _connectAttemptGen &&
+          identical(_connectionOwner, this)) {
+        _connectionOwner = null;
+      }
+      throw FlipperTransportError('BLE connect aborted');
+    }
     if (connectTimedOut) {
       if (connectAttempt == _connectAttemptGen &&
           identical(_connectionOwner, this)) {
@@ -345,6 +399,9 @@ abstract class _UniversalBleTransportBase extends _Transport {
       );
     }
     _link = _BleLinkState.established;
+    _platformConnectAt
+      ..reset()
+      ..start();
     if (connectAttempt != _connectAttemptGen) {
       // A newer attempt owns the platform link now; do not touch it.
       throw StateError('BLE connection attempt superseded');
@@ -525,6 +582,10 @@ abstract class _UniversalBleTransportBase extends _Transport {
         '(${_closeReason ?? 'disconnected'})',
       );
     }
+    _sessionOpenAt
+      ..reset()
+      ..start();
+    _bytesWrittenSinceOpen = 0;
     _startSender();
     LogService.log('[BLE] transport open (rpcSession=$_rpcSessionActive)');
   }
@@ -581,6 +642,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
     if (isConnected) return;
     final wasDisconnecting = _link == _BleLinkState.disconnecting;
     final platformError = error?.trim();
+    final cause = _classifyBleDisconnect(platformError);
     final reason = platformError == null || platformError.isEmpty
         ? 'backend connectionChange disconnected without platform reason '
               '(likely supervision timeout / peer reset / out of range)'
@@ -588,10 +650,67 @@ abstract class _UniversalBleTransportBase extends _Transport {
     final diagnostics =
         'link=${_link.name} budget=$_budget txPending=${_txQueue.length} '
         'rpcSession=${_rpcStatusAvailable ? _rpcSessionActive : 'unknown'}';
+
+    // Precise, single-line disconnect record. linkUpMs/sessionUpMs pin down the
+    // failure to the link layer: a drop within a few seconds of either, with
+    // little or no TX, cannot be the RPC layer's doing. cause= decodes the
+    // CoreBluetooth localizedDescription (the only field universal_ble forwards)
+    // into the concrete CBError meaning and what to do about it.
+    final linkUpMs = _platformConnectAt.isRunning
+        ? '${_platformConnectAt.elapsedMilliseconds}'
+        : 'n/a';
+    final sessionUpMs = _sessionOpenAt.isRunning
+        ? '${_sessionOpenAt.elapsedMilliseconds}'
+        : 'setup-incomplete';
+    LogService.log(
+      '[BLE] disconnect diagnostics: cause=$cause '
+      'linkUpMs=$linkUpMs sessionUpMs=$sessionUpMs '
+      'bytesWrittenSinceOpen=$_bytesWrittenSinceOpen mtu=$_bleMtuSize '
+      'txWithResponse=$_txWithResponse rxIndicate=$_rxUsesIndicate '
+      '$diagnostics wasDisconnecting=$wasDisconnecting '
+      'rawError="${platformError ?? 'none'}"',
+    );
+
     _markBleDisconnected();
     if (!wasDisconnecting) {
-      onTransportFault(FlipperTransportError('BLE $reason ($diagnostics)'));
+      onTransportFault(FlipperTransportError('BLE $reason [$cause] ($diagnostics)'));
     }
+  }
+
+  // Decodes the CoreBluetooth localizedDescription (CBErrorDomain /
+  // CBATTErrorDomain) into the concrete failure class. universal_ble only
+  // forwards the localized string, but each string maps 1:1 to a CBError code,
+  // so this is exact — not a guess. The labels call out the actionable cases
+  // (stale bond / encryption) so they are unmistakable in the log.
+  static String _classifyBleDisconnect(String? platformError) {
+    final e = platformError?.toLowerCase() ?? '';
+    if (e.isEmpty) {
+      return 'NO-REASON (supervision timeout / peer reset / out of range)';
+    }
+    if (e.contains('pairing') || e.contains('bond')) {
+      return 'STALE-BOND CBError.peerRemovedPairingInformation — '
+          'forget device on BOTH Mac BT settings and Flipper, then re-pair';
+    }
+    if (e.contains('encryption') || e.contains('authentication')) {
+      return 'ENCRYPTION/AUTH failure — bonding keys mismatch; re-pair both sides';
+    }
+    if (e.contains('timed out') || e.contains('timeout')) {
+      return 'SUPERVISION-TIMEOUT CBError.connectionTimeout — link lost packets '
+          '(conn params / RF / coexistence), not an RPC issue';
+    }
+    if (e.contains('disconnected from us') ||
+        e.contains('peripheral disconnected') ||
+        e.contains('peripheral is disconnected')) {
+      return 'PEER-INITIATED CBError.peripheralDisconnected — firmware closed '
+          'the link (decode error / its BLE stack reset)';
+    }
+    if (e.contains('connection failed')) {
+      return 'CONNECTION-FAILED CBError.connectionFailed';
+    }
+    if (e.contains('too many') || e.contains('limit')) {
+      return 'LE-DEVICE-LIMIT CBError.tooManyLEPairedDevices — forget some bonds';
+    }
+    return 'UNCLASSIFIED (see rawError)';
   }
 
   void _onValueChange(
@@ -849,6 +968,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
           '[BLE] write callback timed out; continuing without retry',
         );
       }
+      _bytesWrittenSinceOpen += chunkEnd - offset;
       offset = chunkEnd;
     }
   }

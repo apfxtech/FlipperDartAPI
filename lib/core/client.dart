@@ -57,6 +57,11 @@ class FlipperClient {
   _Transport? _transport;
   StreamSubscription<List<int>>? _transportSub;
   FlipperDevice? _connectedDevice;
+  // The target of an in-flight connect attempt (the `connecting` phase). Set
+  // before the platform connect starts and cleared the moment the attempt
+  // commits, fails, or is aborted, so `connectingDevice` reflects only a live
+  // attempt — never a stale one.
+  FlipperDevice? _connectingDevice;
   FlipperMode _mode = FlipperMode.disconnected;
   Future<void>? _switchToRpcFuture;
   Future<void>? _deviceInfoFetch;
@@ -174,6 +179,17 @@ class FlipperClient {
   List<FlipperDevice> listDevices() => devices;
 
   FlipperDevice? get connectedDevice => _connectedDevice;
+
+  /// True while a connection attempt is in flight (no session committed yet).
+  bool get isConnecting => _linkPhase == _LinkPhase.connecting;
+
+  /// The target of the in-flight connect attempt, or null when not connecting.
+  FlipperDevice? get connectingDevice => _connectingDevice;
+
+  /// The device the client is connected to, or — when an attempt is still in
+  /// flight — the one it is connecting to. Lets a UI surface and tear down a
+  /// stuck connect without waiting for it to commit or time out.
+  FlipperDevice? get activeDevice => _connectedDevice ?? _connectingDevice;
 
   Map<String, String> get deviceInfoCache => Map.unmodifiable(_deviceInfoCache);
 
@@ -380,8 +396,21 @@ class FlipperClient {
   Future<FlipperDevice> connect(FlipperDevice device) =>
       _serialized(() => _connectLocked(device));
 
-  Future<void> disconnect() =>
-      _serialized(() => _teardownLocked('disconnect requested'));
+  Future<void> disconnect() {
+    // A connect attempt in flight holds the platform link and sits ahead of
+    // this teardown in the lifecycle chain. Abort the platform connect up front
+    // so the attempt unwinds now instead of blocking the user's disconnect for
+    // the full connect timeout. Harmless when nothing is connecting.
+    _abortConnectInFlight();
+    return _serialized(() => _teardownLocked('disconnect requested'));
+  }
+
+  void _abortConnectInFlight() {
+    if (_linkPhase != _LinkPhase.connecting) return;
+    if (_connectingDevice?.isBle ?? false) {
+      _UniversalBleTransportBase.abortPendingConnect();
+    }
+  }
 
   // Appends a lifecycle operation to the chain. The chain never breaks: a
   // failed operation surfaces its error to its own caller only.
@@ -587,6 +616,10 @@ class FlipperClient {
     // `disconnected` on failure/supersession, or advances to `connected` the
     // moment the transport is committed (kept in lockstep with `_transport`).
     _linkPhase = _LinkPhase.connecting;
+    _connectingDevice = device;
+    // Announce the in-flight attempt so a UI can show it and offer to cancel it
+    // before it commits or times out (this phase blocks scanning).
+    _emitConnecting(device);
     LogService.log(
       '[FlipperClient] connecting to ${device.name} '
       '(${device.link.name}:${device.id})',
@@ -597,6 +630,7 @@ class FlipperClient {
       await transport.open();
     } catch (error) {
       _linkPhase = _LinkPhase.disconnected;
+      _clearConnecting(device);
       LogService.log(
         '[FlipperClient] connect failed '
         'device=${device.name} link=${device.link.name}: $error',
@@ -607,6 +641,7 @@ class FlipperClient {
 
     if (gen != _sessionGen) {
       _linkPhase = _LinkPhase.disconnected;
+      _clearConnecting(device);
       await transport.close();
       throw StateError('Connection attempt superseded');
     }
@@ -614,6 +649,9 @@ class FlipperClient {
     _transport = transport;
     _linkPhase = _LinkPhase.connected;
     _connectedDevice = device;
+    // Hand off to the committed-session state; the `connected` event below comes
+    // from _setMode once the transport's initial mode is applied.
+    if (identical(_connectingDevice, device)) _connectingDevice = null;
     _transportSub = transport.bytesStream.listen(
       _onTransportBytes,
       onError: (Object error, StackTrace stackTrace) {
@@ -666,6 +704,7 @@ class FlipperClient {
     _linkPhase = _LinkPhase.disconnected;
     _transportSub = null;
     _connectedDevice = null;
+    _connectingDevice = null;
     _switchToRpcFuture = null;
     _deviceInfoFetch = null;
     _deviceInfoCache.clear();
@@ -1668,6 +1707,35 @@ class FlipperClient {
     await _deviceInfoCompleteCtrl.close();
     await _deviceInfoWatchCtrl.close();
     await _storageMutationCtrl.close();
+  }
+
+  // Emits the in-flight connect as a connection event. Goes straight to the
+  // controller rather than through _setMode: the mode stays `disconnected`
+  // until the transport commits, so there is no mode transition to ride on.
+  void _emitConnecting(FlipperDevice device) {
+    _connectionCtrl.add(
+      FlipperConnectionState(
+        mode: _mode,
+        device: device,
+        connected: false,
+        connecting: true,
+      ),
+    );
+  }
+
+  // Clears the in-flight attempt (only if [device] still owns it — a newer
+  // attempt may have replaced it) and announces the terminal disconnect, which
+  // _setMode would swallow because the mode never left `disconnected`.
+  void _clearConnecting(FlipperDevice device) {
+    if (!identical(_connectingDevice, device)) return;
+    _connectingDevice = null;
+    _connectionCtrl.add(
+      FlipperConnectionState(
+        mode: _mode,
+        device: null,
+        connected: false,
+      ),
+    );
   }
 
   void _setMode(

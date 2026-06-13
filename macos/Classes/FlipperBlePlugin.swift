@@ -56,7 +56,21 @@ public final class FlipperBlePlugin: NSObject, FlutterPlugin {
         qos: .userInteractive
     )
 
-    private var central: CBCentralManager!
+    // Lazily created so the plugin registering does not, by itself, spin up a
+    // second CBCentralManager. The Dart side now drives the whole BLE lifecycle
+    // (scan + connect + GATT) through universal_ble's single central; this
+    // native central is only built if some method channel call actually touches
+    // it. Two coexisting CBCentralManagers in one process is exactly what Apple
+    // warns against — they contend for connection-event scheduling and the link
+    // drops with spurious supervision timeouts even while idle.
+    //
+    // First access is always on bleQueue (handle() dispatches there before any
+    // central use, and every delegate callback already runs on bleQueue), so
+    // the non-atomic lazy initialization stays single-threaded.
+    private lazy var central: CBCentralManager = CBCentralManager(
+        delegate: self, queue: bleQueue,
+        options: [CBCentralManagerOptionShowPowerAlertKey: true]
+    )
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var pstate: [UUID: PeripheralState] = [:]
     private var pendingConnects: [UUID: FlutterResult] = [:]
@@ -64,12 +78,6 @@ public final class FlipperBlePlugin: NSObject, FlutterPlugin {
     // UUIDs we are scanning for to satisfy a connect() call
     private var connectScanTargets: Set<UUID> = []
     private var eventSink: FlutterEventSink?
-
-    public override init() {
-        super.init()
-        central = CBCentralManager(delegate: self, queue: bleQueue,
-                                   options: [CBCentralManagerOptionShowPowerAlertKey: true])
-    }
 
     // MARK: - Helpers
 
