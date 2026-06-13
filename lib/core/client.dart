@@ -18,6 +18,12 @@ class FlipperClient {
   static const Duration _quickDropWindow = Duration(seconds: 30);
   static const int _maxQuickDropStreak = 2;
 
+  // Pause between a dropped link and the in-place reconnect attempt. Gives the
+  // platform BLE stack time to finish tearing down the old connection — an
+  // instant re-connect races CoreBluetooth's cleanup and wedges the new
+  // attempt (lost write callbacks, then a full connect timeout).
+  static const Duration _reconnectSettle = Duration(milliseconds: 600);
+
   final _devicesCtrl = StreamController<List<FlipperDevice>>.broadcast();
   final _connectionCtrl = StreamController<FlipperConnectionState>.broadcast();
   final _modeCtrl = StreamController<FlipperMode>.broadcast();
@@ -415,6 +421,16 @@ class FlipperClient {
     if (sub != null) await sub.cancel();
     if (transport != null) await transport.close();
 
+    // Settle before re-opening. After a fault the transport is already closed,
+    // so close() returns without waiting for the platform disconnect to
+    // confirm; re-connecting in the same instant leaves CoreBluetooth still
+    // tearing down the old CBPeripheral, which wedges the new attempt (lost
+    // write callbacks, then a 20s connect timeout). A brief pause lets the
+    // platform release the old link first.
+    final settleGen = _sessionGen;
+    await Future<void>.delayed(_reconnectSettle);
+    if (settleGen != _sessionGen) return;
+
     try {
       await _establishLocked(device);
     } catch (error) {
@@ -662,15 +678,11 @@ class FlipperClient {
   }
 
   Future<void> _doSwitchToRpcMode() async {
-    final transport = _transport;
-    if (transport == null) {
-      // The session is already gone — e.g. enterRpcMode() called from a page's
-      // dispose() right after the link dropped. Restoring RPC mode on a dead
-      // transport is a no-op, not an error: throwing here would surface as an
-      // unhandled exception out of the unawaited dispose() path and crash the
-      // frame.
-      return;
-    }
+    // Strict on purpose: a real RPC sender (callRpcFrames / sendRpc switches
+    // here) must fail fast when there is no transport instead of enqueuing a
+    // request that can only time out. The lenient "already disconnected"
+    // handling lives in enterRpcMode(), the mode-restore entry point.
+    final transport = _requireTransport();
     if (_mode == FlipperMode.rpc) return;
     if (!transport.supportsCli) {
       if (identical(_transport, transport)) {
@@ -712,7 +724,15 @@ class FlipperClient {
     LogService.log('[RPC] RPC mode active');
   }
 
-  Future<void> enterRpcMode() => switchToRpcMode();
+  // Mode-restore entry point (UI lifecycle, e.g. a CLI page's dispose()).
+  // Unlike the RPC senders, it is lenient: if the session is already gone there
+  // is nothing to restore, so it returns quietly instead of throwing. Callers
+  // fire it unawaited, where a thrown "No active transport" would otherwise
+  // surface as an unhandled exception and crash the frame.
+  Future<void> enterRpcMode() {
+    if (_transport == null) return Future.value();
+    return switchToRpcMode();
+  }
 
   Future<void> switchToCliMode() => _serialized(_switchToCliLocked);
 
