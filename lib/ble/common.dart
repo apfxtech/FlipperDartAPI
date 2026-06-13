@@ -301,6 +301,12 @@ abstract class _UniversalBleTransportBase extends _Transport {
   Completer<void>? _rpcActiveSignal;
 
   Completer<void>? _disconnectSignal;
+  // Completed the instant the link drops (or the transport is closed) while
+  // open()/_subscribeRpcStatus are still setting up GATT, so every setup await
+  // aborts immediately instead of each waiting out its own multi-second
+  // timeout. Without this, a peer disconnect mid-setup wedged connect for the
+  // full 15 s GATT window even though the platform already reported the drop.
+  Completer<void>? _setupGuard;
   bool _senderRunning = false;
   int _writeTimeoutStreak = 0;
   static const int _maxWriteTimeoutStreak = 2;
@@ -471,6 +477,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
   @override
   Future<void> open() async {
     _activeTransport = this;
+    _setupGuard = Completer<void>();
     _ops.onConnectionChange = _onConnectionChange;
     _ops.onValueChange = _onValueChange;
     _link = _BleLinkState.connected;
@@ -478,21 +485,29 @@ abstract class _UniversalBleTransportBase extends _Transport {
     final deviceId = _device.device.deviceId;
     try {
       if (_rxUsesIndicate) {
-        await _ops
-            .subscribeIndications(deviceId, _rxSvcId, _rxCharId)
-            .timeout(_gattOpTimeout);
+        await _awaitSetup(
+          _ops.subscribeIndications(deviceId, _rxSvcId, _rxCharId),
+          _gattOpTimeout,
+        );
       } else {
-        await _ops
-            .subscribeNotifications(deviceId, _rxSvcId, _rxCharId)
-            .timeout(_gattOpTimeout);
+        await _awaitSetup(
+          _ops.subscribeNotifications(deviceId, _rxSvcId, _rxCharId),
+          _gattOpTimeout,
+        );
       }
 
-      await _ops
-          .subscribeNotifications(deviceId, _overflowSvcId!, _overflowCharId!)
-          .timeout(_gattOpTimeout);
-      final initialBudget = await _ops
-          .read(deviceId, _overflowSvcId!, _overflowCharId!)
-          .timeout(_gattOpTimeout);
+      await _awaitSetup(
+        _ops.subscribeNotifications(
+          deviceId,
+          _overflowSvcId!,
+          _overflowCharId!,
+        ),
+        _gattOpTimeout,
+      );
+      final initialBudget = await _awaitSetup(
+        _ops.read(deviceId, _overflowSvcId!, _overflowCharId!),
+        _gattOpTimeout,
+      );
       _applyOverflowValue(initialBudget);
     } on TimeoutException {
       throw FlipperTransportError(
@@ -503,8 +518,44 @@ abstract class _UniversalBleTransportBase extends _Transport {
 
     await _subscribeRpcStatus(deviceId);
     await _openExtra();
+    // A drop during the rpcStatus subscribe (swallowed below) or the _openExtra
+    // settle must not commit a dead transport; fail the connect honestly.
+    if (!isActive) {
+      throw FlipperTransportError(
+        'BLE link dropped during session setup '
+        '(${_closeReason ?? 'disconnected'})',
+      );
+    }
     _startSender();
     LogService.log('[BLE] transport open (rpcSession=$_rpcSessionActive)');
+  }
+
+  // Awaits a setup GATT operation, but bails out the instant the link drops
+  // mid-flight (_setupGuard) instead of waiting out the full [timeout]. The
+  // underlying op is left to settle on its own and its result is ignored.
+  Future<T> _awaitSetup<T>(Future<T> op, Duration timeout) {
+    final guard = _setupGuard;
+    if (guard == null) return op.timeout(timeout);
+    final completer = Completer<T>();
+    op.then(
+      (value) {
+        if (!completer.isCompleted) completer.complete(value);
+      },
+      onError: (Object error, StackTrace stack) {
+        if (!completer.isCompleted) completer.completeError(error, stack);
+      },
+    );
+    guard.future.then((_) {
+      if (!completer.isCompleted) {
+        completer.completeError(
+          FlipperTransportError(
+            'BLE link dropped during session setup '
+            '(${_closeReason ?? 'disconnected'})',
+          ),
+        );
+      }
+    });
+    return completer.future.timeout(timeout);
   }
 
   Future<void> _subscribeRpcStatus(String deviceId) async {
@@ -839,6 +890,7 @@ abstract class _UniversalBleTransportBase extends _Transport {
 
   @override
   void onFaultExtra(Object error) {
+    _fireSignal(_setupGuard);
     _releaseSenderSignals();
     _failAllPending(error);
     _markBleDisconnected();
@@ -854,6 +906,9 @@ abstract class _UniversalBleTransportBase extends _Transport {
 
   @override
   Future<void> doClose() async {
+    // A close() racing an in-flight open() (e.g. a superseded attempt) must
+    // unblock its setup awaits too, not just fault-driven teardown.
+    _fireSignal(_setupGuard);
     _releaseSenderSignals();
     _failAllPending(StateError('BLE transport closed'));
     if (!identical(_connectionOwner, this)) {

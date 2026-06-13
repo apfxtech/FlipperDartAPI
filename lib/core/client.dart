@@ -78,6 +78,13 @@ class FlipperClient {
 
   int _nextCommandId = 1;
   bool _scanning = false;
+  // True from the moment a BLE connect starts until its transport is committed
+  // (or the attempt fails). Scanning competes with the connecting radio — on
+  // macOS the scan runs on a *second* CBCentralManager (universal_ble) while
+  // the link runs on the native plugin, and the contention provokes the very
+  // "connection timed out unexpectedly" drops seen during setup — so scanning
+  // is refused for the whole connect window, not just once a session is live.
+  bool _bleConnecting = false;
   Completer<void>? _scanPhaseInterrupt;
 
   // Devices-stream throttle: scan results arrive per advertising packet
@@ -244,8 +251,11 @@ class FlipperClient {
       // Scanning competes with an active BLE link for the radio (on macOS a
       // second CBCentralManager halves effective throughput and provokes
       // drops); USB sessions are unaffected.
-      if (_transport != null && (_connectedDevice?.isBle ?? false)) {
-        LogService.log('[BLE] scan skipped: BLE session is active');
+      if (_bleConnecting ||
+          (_transport != null && (_connectedDevice?.isBle ?? false))) {
+        LogService.log(
+          '[BLE] scan skipped: a BLE connection is active or in progress',
+        );
         return;
       }
 
@@ -513,6 +523,10 @@ class FlipperClient {
     await stopScan();
 
     final gen = ++_sessionGen;
+    // Refuse scans for the whole connect window (see _bleConnecting). Cleared
+    // at every exit: failure, supersession, and right after the transport is
+    // committed (where the live-session guard takes over).
+    _bleConnecting = device.isBle;
     LogService.log(
       '[FlipperClient] connecting to ${device.name} '
       '(${device.link.name}:${device.id})',
@@ -522,6 +536,7 @@ class FlipperClient {
       transport = await _openTransport(device);
       await transport.open();
     } catch (error) {
+      _bleConnecting = false;
       LogService.log(
         '[FlipperClient] connect failed '
         'device=${device.name} link=${device.link.name}: $error',
@@ -531,11 +546,13 @@ class FlipperClient {
     }
 
     if (gen != _sessionGen) {
+      _bleConnecting = false;
       await transport.close();
       throw StateError('Connection attempt superseded');
     }
 
     _transport = transport;
+    _bleConnecting = false;
     _connectedDevice = device;
     _transportSub = transport.bytesStream.listen(
       _onTransportBytes,
@@ -645,7 +662,15 @@ class FlipperClient {
   }
 
   Future<void> _doSwitchToRpcMode() async {
-    final transport = _requireTransport();
+    final transport = _transport;
+    if (transport == null) {
+      // The session is already gone — e.g. enterRpcMode() called from a page's
+      // dispose() right after the link dropped. Restoring RPC mode on a dead
+      // transport is a no-op, not an error: throwing here would surface as an
+      // unhandled exception out of the unawaited dispose() path and crash the
+      // frame.
+      return;
+    }
     if (_mode == FlipperMode.rpc) return;
     if (!transport.supportsCli) {
       if (identical(_transport, transport)) {
