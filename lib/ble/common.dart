@@ -39,14 +39,21 @@ abstract class _BleOps {
   Future<void> subscribeNotifications(
     String deviceId,
     String svcId,
-    String charId,
-  );
+    String charId, {
+    Duration? timeout,
+  });
   Future<void> subscribeIndications(
     String deviceId,
     String svcId,
-    String charId,
-  );
-  Future<Uint8List> read(String deviceId, String svcId, String charId);
+    String charId, {
+    Duration? timeout,
+  });
+  Future<Uint8List> read(
+    String deviceId,
+    String svcId,
+    String charId, {
+    Duration? timeout,
+  });
   Future<void> write(
     String deviceId,
     String svcId,
@@ -103,19 +110,35 @@ class _UniversalBleOps implements _BleOps {
   Future<void> subscribeNotifications(
     String deviceId,
     String svcId,
-    String charId,
-  ) => uble.UniversalBle.subscribeNotifications(deviceId, svcId, charId);
+    String charId, {
+    Duration? timeout,
+  }) => uble.UniversalBle.subscribeNotifications(
+    deviceId,
+    svcId,
+    charId,
+    timeout: timeout,
+  );
 
   @override
   Future<void> subscribeIndications(
     String deviceId,
     String svcId,
-    String charId,
-  ) => uble.UniversalBle.subscribeIndications(deviceId, svcId, charId);
+    String charId, {
+    Duration? timeout,
+  }) => uble.UniversalBle.subscribeIndications(
+    deviceId,
+    svcId,
+    charId,
+    timeout: timeout,
+  );
 
   @override
-  Future<Uint8List> read(String deviceId, String svcId, String charId) =>
-      uble.UniversalBle.read(deviceId, svcId, charId);
+  Future<Uint8List> read(
+    String deviceId,
+    String svcId,
+    String charId, {
+    Duration? timeout,
+  }) => uble.UniversalBle.read(deviceId, svcId, charId, timeout: timeout);
 
   @override
   Future<void> write(
@@ -241,17 +264,24 @@ abstract class _UniversalBleTransportBase extends _Transport {
       '19ed82ae-ed21-4c9d-4145-228e64fe0000';
   static const int _bleChunkSize = 512;
   static const int _minBleMtuSize = 20;
+  // Firmware RPC_BUFFER_SIZE (serial_service.c). The firmware resets this buffer
+  // on a fresh connection and grants the full 1024-byte credit, so this is the
+  // initial flow-control credit to assume when the first credit read races ahead
+  // of that grant and returns 0.
+  static const int _rpcBufferSize = 1024;
   // DO NOT CHANGE: 160 is the empirically stable ATT write payload for this
   // firmware. Raising it toward the 411-byte ATT_MTU ceiling makes link drops
   // far more frequent.
   static const int _maxBleMtuSize = 160;
-  // Platform connect attempts never time out on their own (CoreBluetooth keeps
-  // them pending forever); bonded-link re-encryption also happens inside this
-  // step.
-  static const Duration _connectTimeout = Duration(seconds: 20);
-  // Bound for individual GATT operations (MTU, discovery, subscriptions,
-  // characteristic reads) during session setup.
+  // Bound for the unencrypted GATT setup steps (MTU negotiation, service
+  // discovery).
   static const Duration _gattOpTimeout = Duration(seconds: 15);
+  // Per-attempt bound for the encrypted setup ops (subscribe/read) that trigger
+  // pairing. universal_ble's command queue otherwise applies a 10 s default that
+  // killed the read while the user was still typing the PIN. This is generous on
+  // purpose (PIN entry is slow); on expiry _runPairingSensitive just retries, so
+  // the effective wait is unbounded until the link drops or the user cancels.
+  static const Duration _pairingOpTimeout = Duration(minutes: 5);
   // Bound for a single ATT write callback before it is treated as lost.
   static const Duration _writeCallbackTimeout = Duration(seconds: 15);
   // TX stall watchdog: with data pending, the firmware must grant credit /
@@ -307,9 +337,15 @@ abstract class _UniversalBleTransportBase extends _Transport {
 
   Completer<void>? _disconnectSignal;
   // Completes when the user aborts an in-flight connect (see abortPendingConnect)
-  // so the platform connect await stops immediately instead of waiting out
-  // _connectTimeout. Live only for the duration of the connect await.
+  // so the platform connect await stops immediately. Live only for the duration
+  // of a platform connect await.
   Completer<void>? _connectAbort;
+  // Live for the whole pairing reconnect loop in open(). First-time pairing can
+  // drop the link by supervision timeout before the user finishes typing the
+  // PIN; the loop reconnects and retries until pairing succeeds. This completer
+  // is fired when the user cancels (abortPendingConnect) so the loop stops
+  // reconnecting instead of retrying forever.
+  Completer<void>? _pairingAbort;
   // Completed the instant the link drops (or the transport is closed) while
   // open()/_subscribeRpcStatus are still setting up GATT, so every setup await
   // aborts immediately instead of each waiting out its own multi-second
@@ -342,6 +378,10 @@ abstract class _UniversalBleTransportBase extends _Transport {
   void _abortConnect() {
     final abort = _connectAbort;
     if (abort != null && !abort.isCompleted) abort.complete();
+    // Also stop the pairing reconnect loop so a cancel during PIN entry does not
+    // immediately reconnect and retry.
+    final pairing = _pairingAbort;
+    if (pairing != null && !pairing.isCompleted) pairing.complete();
     unawaited(
       _ops.disconnect(_device.device.deviceId).catchError((Object e) {
         LogService.log('[BLE] abort-connect cancel failed: $e');
@@ -353,15 +393,17 @@ abstract class _UniversalBleTransportBase extends _Transport {
     final deviceId = _device.device.deviceId;
     final connectAttempt = ++_connectAttemptGen;
     _connectionOwner = this;
-    var connectTimedOut = false;
     var aborted = false;
     final abort = _connectAbort = Completer<void>();
-    final connectFuture = _ops.connect(deviceId).timeout(
-      _connectTimeout,
-      onTimeout: () {
-        connectTimedOut = true;
-      },
-    );
+    // The platform connect is intentionally NOT bounded by a timeout. First-time
+    // bonding and bonded-link re-encryption both happen inside this step and can
+    // take a long time (the OS may show a PIN prompt the user types at their own
+    // pace). A fixed timeout fired mid-bonding and the cleanup disconnect aborted
+    // it — on some platforms also dismissing the PIN dialog. A stuck/unreachable
+    // attempt is unwound only by the user (dialog Cancel -> abortPendingConnect)
+    // or by a newer attempt superseding this one. A genuine platform connect
+    // failure still throws out of the await below.
+    final connectFuture = _ops.connect(deviceId);
     // If the abort wins the race, the connect future is left to settle on its
     // own (_abortConnect already cancelled it on the platform side); swallow its
     // late outcome so it does not surface as an unhandled async error.
@@ -382,21 +424,6 @@ abstract class _UniversalBleTransportBase extends _Transport {
         _connectionOwner = null;
       }
       throw FlipperTransportError('BLE connect aborted');
-    }
-    if (connectTimedOut) {
-      if (connectAttempt == _connectAttemptGen &&
-          identical(_connectionOwner, this)) {
-        unawaited(
-          _ops.disconnect(deviceId).catchError((Object e) {
-            LogService.log('[BLE] connect-timeout cancel failed: $e');
-          }),
-        );
-      }
-      throw FlipperTransportError(
-        'BLE connect timeout after ${_connectTimeout.inSeconds}s '
-        '(device unreachable, or its bond/encryption is stalled — '
-        'try forgetting the pairing on both sides)',
-      );
     }
     _link = _BleLinkState.established;
     _platformConnectAt
@@ -533,43 +560,46 @@ abstract class _UniversalBleTransportBase extends _Transport {
   @override
   Future<void> open() async {
     _activeTransport = this;
-    _setupGuard = Completer<void>();
+    _connectionOwner = this;
     _ops.onConnectionChange = _onConnectionChange;
     _ops.onValueChange = _onValueChange;
+    // The platform link is already up here (_configure connected it).
     _link = _BleLinkState.connected;
 
     final deviceId = _device.device.deviceId;
+    // First-time pairing reconnect loop. The encrypted setup below triggers the
+    // system PIN prompt; on a never-bonded device the BLE link is frequently
+    // dropped by the controller (supervision/pairing timeout, wasDisconnecting=
+    // false) before the user finishes typing the PIN. Once the PIN is accepted
+    // the OS stores the bond, so reconnecting and retrying eventually succeeds
+    // over an encrypted link. Loop until setup completes or the user cancels
+    // (Cancel -> abortPendingConnect -> _pairingAbort).
+    final pairingAbort = _pairingAbort = Completer<void>();
     try {
-      if (_rxUsesIndicate) {
-        await _awaitSetup(
-          _ops.subscribeIndications(deviceId, _rxSvcId, _rxCharId),
-          _gattOpTimeout,
-        );
-      } else {
-        await _awaitSetup(
-          _ops.subscribeNotifications(deviceId, _rxSvcId, _rxCharId),
-          _gattOpTimeout,
-        );
+      var attempt = 0;
+      while (true) {
+        _setupGuard = Completer<void>();
+        try {
+          await _openEncryptedSetup(deviceId);
+          break;
+        } catch (e) {
+          if (pairingAbort.isCompleted) {
+            throw FlipperTransportError('BLE connect aborted');
+          }
+          if (!_isPairingDrop(e)) rethrow;
+          attempt++;
+          LogService.log(
+            '[BLE] link dropped during first-time pairing (attempt $attempt); '
+            'reconnecting so the user can finish entering the PIN',
+          );
+          final reconnected = await _reconnectForPairing(deviceId, pairingAbort);
+          if (!reconnected) {
+            throw FlipperTransportError('BLE connect aborted');
+          }
+        }
       }
-
-      await _awaitSetup(
-        _ops.subscribeNotifications(
-          deviceId,
-          _overflowSvcId!,
-          _overflowCharId!,
-        ),
-        _gattOpTimeout,
-      );
-      final initialBudget = await _awaitSetup(
-        _ops.read(deviceId, _overflowSvcId!, _overflowCharId!),
-        _gattOpTimeout,
-      );
-      _applyOverflowValue(initialBudget);
-    } on TimeoutException {
-      throw FlipperTransportError(
-        'BLE session setup (subscriptions / overflow read) timed out '
-        'after ${_gattOpTimeout.inSeconds}s',
-      );
+    } finally {
+      if (identical(_pairingAbort, pairingAbort)) _pairingAbort = null;
     }
 
     await _subscribeRpcStatus(deviceId);
@@ -592,10 +622,13 @@ abstract class _UniversalBleTransportBase extends _Transport {
 
   // Awaits a setup GATT operation, but bails out the instant the link drops
   // mid-flight (_setupGuard) instead of waiting out the full [timeout]. The
-  // underlying op is left to settle on its own and its result is ignored.
-  Future<T> _awaitSetup<T>(Future<T> op, Duration timeout) {
+  // underlying op is left to settle on its own and its result is ignored. A
+  // null [timeout] waits indefinitely (used for the pairing-sensitive steps,
+  // see _runPairingSensitive): the only thing that ends the wait is the op
+  // settling or the link actually dropping.
+  Future<T> _awaitSetup<T>(Future<T> op, [Duration? timeout]) {
     final guard = _setupGuard;
-    if (guard == null) return op.timeout(timeout);
+    if (guard == null) return timeout == null ? op : op.timeout(timeout);
     final completer = Completer<T>();
     op.then(
       (value) {
@@ -615,7 +648,234 @@ abstract class _UniversalBleTransportBase extends _Transport {
         );
       }
     });
-    return completer.future.timeout(timeout);
+    final future = completer.future;
+    return timeout == null ? future : future.timeout(timeout);
+  }
+
+  // Runs a setup GATT operation that may trigger first-time BLE pairing.
+  //
+  // On Apple (macOS/iOS) there is no blocking system-pairing API: the first
+  // access to an encrypted characteristic of an un-bonded device makes
+  // CoreBluetooth kick off pairing IN THE BACKGROUND (showing the system PIN
+  // prompt) and IMMEDIATELY return "Encryption is insufficient" (CBATTError 15)
+  // instead of waiting. If that error is treated as fatal, open() throws and the
+  // client closes the link (cancelPeripheralConnection) — which aborts the
+  // in-flight pairing and makes the PIN prompt vanish the instant it appeared.
+  //
+  // So we never tear the link down on that error: we just retry the op while
+  // pairing is still in progress, waiting as long as the user needs to type the
+  // PIN. The loop ends only when the op finally succeeds (pairing done) or the
+  // link genuinely drops (_setupGuard, e.g. the user cancels the connect).
+  Future<T> _runPairingSensitive<T>(Future<T> Function() op) async {
+    var logged = false;
+    while (true) {
+      final guard = _setupGuard;
+      if (guard == null || guard.isCompleted) {
+        // No active setup (or the link already dropped): run once, no retry.
+        return _awaitSetup(op());
+      }
+      try {
+        return await _awaitSetup(op());
+      } on FlipperTransportError {
+        // _setupGuard fired: the link really dropped — propagate, do not loop.
+        rethrow;
+      } catch (e) {
+        // Retry while pairing is in progress: either the device answered
+        // "insufficient encryption" (pairing not done yet) or the op exceeded
+        // _pairingOpTimeout while the user was still typing the PIN. Anything
+        // else is a real error.
+        if (!_isInsufficientEncryption(e) && e is! TimeoutException) rethrow;
+        if (!logged) {
+          LogService.log(
+            '[BLE] encrypted characteristic needs pairing; awaiting PIN entry '
+            '(retrying without tearing the link down)',
+          );
+          logged = true;
+        }
+        // Pairing is running in the background; give the user time and retry.
+        // Bail immediately if the link drops while we wait.
+        await Future.any<void>([
+          Future<void>.delayed(const Duration(milliseconds: 800)),
+          guard.future,
+        ]);
+      }
+    }
+  }
+
+  static bool _isInsufficientEncryption(Object e) {
+    final s = e.toString().toLowerCase();
+    return s.contains('insufficient encryption') ||
+        s.contains('encryption is insufficient') ||
+        s.contains('insufficient authentication') ||
+        s.contains('authentication is insufficient');
+  }
+
+  // The encrypted GATT setup steps. _runPairingSensitive retries each on
+  // "insufficient encryption" while the link is alive (pairing in progress); a
+  // real link drop surfaces as a FlipperTransportError that open()'s reconnect
+  // loop handles.
+  //
+  // ORDER MATTERS. Establish encryption FIRST (a read of an encrypted
+  // characteristic triggers pairing and blocks until it completes), only THEN
+  // subscribe: on Apple a notification subscribe (CCCD write) registered on an
+  // UNencrypted link silently fails to activate, so the firmware's credit/RX
+  // notifications never arrive and TX stalls forever with budget=0 ("waiting for
+  // overflow credit").
+  //
+  // The pairing trigger reads the rpcStatus characteristic, NOT the overflow
+  // one. The overflow characteristic must be read EXACTLY ONCE per session (for
+  // the initial credit): reading it returns the stored credit rather than a
+  // fresh grant, and an extra read desyncs the firmware's flow-control counter,
+  // which later trips ERROR_DECODE and makes the firmware reset its BLE stack
+  // (seen as a PEER-INITIATED drop minutes in). rpcStatus is a plain status read
+  // with no such side effect.
+  Future<void> _openEncryptedSetup(String deviceId) async {
+    // 1. Pair / establish encryption via a side-effect-free encrypted read.
+    final rpcSvc = _rpcStatusSvcId;
+    final rpcChr = _rpcStatusCharId;
+    if (rpcSvc != null && rpcChr != null) {
+      await _runPairingSensitive(
+        () => _ops.read(deviceId, rpcSvc, rpcChr, timeout: _pairingOpTimeout),
+      );
+    } else {
+      // rpcStatus is a required characteristic (see _configureConnected), so
+      // this fallback should be unreachable; pair via overflow only if it is
+      // somehow absent.
+      await _runPairingSensitive(
+        () => _ops.read(
+          deviceId,
+          _overflowSvcId!,
+          _overflowCharId!,
+          timeout: _pairingOpTimeout,
+        ),
+      );
+    }
+
+    // 2. RX notifications, now on the encrypted link.
+    if (_rxUsesIndicate) {
+      await _runPairingSensitive(
+        () => _ops.subscribeIndications(
+          deviceId,
+          _rxSvcId,
+          _rxCharId,
+          timeout: _pairingOpTimeout,
+        ),
+      );
+    } else {
+      await _runPairingSensitive(
+        () => _ops.subscribeNotifications(
+          deviceId,
+          _rxSvcId,
+          _rxCharId,
+          timeout: _pairingOpTimeout,
+        ),
+      );
+    }
+
+    // 3. Overflow (flow-control credit) notifications, on the encrypted link.
+    await _runPairingSensitive(
+      () => _ops.subscribeNotifications(
+        deviceId,
+        _overflowSvcId!,
+        _overflowCharId!,
+        timeout: _pairingOpTimeout,
+      ),
+    );
+
+    // 4. Authoritative initial credit — the ONLY overflow read of the session.
+    final initialBudget = await _runPairingSensitive(
+      () => _ops.read(
+        deviceId,
+        _overflowSvcId!,
+        _overflowCharId!,
+        timeout: _pairingOpTimeout,
+      ),
+    );
+    _applyOverflowValue(initialBudget);
+
+    // A fresh connection resets the firmware RPC buffer and grants the full
+    // 1024-byte credit. If the read above raced ahead of that grant and saw 0,
+    // seed the standard buffer size so the first TX cycle is not stalled waiting
+    // for a credit notification that effectively already happened.
+    if (_budget <= 0) {
+      _budget = _rpcBufferSize;
+      _budgetGen += 1;
+      LogService.log(
+        '[BLE] initial overflow credit was 0; seeding RPC_BUFFER_SIZE '
+        '($_rpcBufferSize) on fresh connection',
+      );
+    }
+  }
+
+  // True when [e] signals the link dropped mid-setup (the _setupGuard error).
+  // During first-time pairing that drop is the controller giving up before the
+  // PIN was entered, not a fatal error — open() reconnects and retries.
+  static bool _isPairingDrop(Object e) {
+    if (e is! FlipperTransportError) return false;
+    return e.toString().toLowerCase().contains(
+      'link dropped during session setup',
+    );
+  }
+
+  // Re-establishes the platform link after it dropped mid-pairing, retrying
+  // until the link is back up (services rediscovered) or the user cancels.
+  // Returns true when the link is ready for another setup attempt, false if the
+  // user aborted. A fault clears the callbacks/ownership, so they are restored
+  // here before each connect.
+  Future<bool> _reconnectForPairing(
+    String deviceId,
+    Completer<void> pairingAbort,
+  ) async {
+    while (!pairingAbort.isCompleted) {
+      // Let the platform finish tearing the old link down before reconnecting;
+      // an instant re-connect races CoreBluetooth/BlueZ cleanup.
+      await Future.any<void>([
+        Future<void>.delayed(const Duration(milliseconds: 600)),
+        pairingAbort.future,
+      ]);
+      if (pairingAbort.isCompleted) return false;
+
+      _activeTransport = this;
+      _connectionOwner = this;
+      _ops.onConnectionChange = _onConnectionChange;
+      _ops.onValueChange = _onValueChange;
+
+      var aborted = false;
+      final abort = _connectAbort = Completer<void>();
+      final connectFuture = _ops.connect(deviceId);
+      unawaited(connectFuture.catchError((_) {}));
+      try {
+        await Future.any<void>([
+          // Settle on success OR failure without rethrowing — a failed connect
+          // is just retried below, not propagated.
+          connectFuture.then((_) {}, onError: (_) {}),
+          abort.future.then((_) => aborted = true),
+          pairingAbort.future.then((_) => aborted = true),
+        ]);
+      } finally {
+        if (identical(_connectAbort, abort)) _connectAbort = null;
+      }
+      if (aborted || pairingAbort.isCompleted) return false;
+
+      // connectFuture may have failed; confirm the link is actually up.
+      final state = await _ops.getConnectionState(deviceId);
+      if (state != _BleConnState.connected) {
+        LogService.log('[BLE] pairing reconnect: link not up yet, retrying');
+        continue;
+      }
+      _link = _BleLinkState.established;
+      // universal_ble requires a fresh discovery after each connect before GATT
+      // ops; the char IDs parsed in _configure stay valid.
+      try {
+        await _ops.discoverServices(deviceId).timeout(_gattOpTimeout);
+      } catch (e) {
+        LogService.log('[BLE] pairing reconnect: discoverServices failed: $e');
+        continue;
+      }
+      _link = _BleLinkState.connected;
+      return true;
+    }
+    return false;
   }
 
   Future<void> _subscribeRpcStatus(String deviceId) async {
@@ -671,10 +931,37 @@ abstract class _UniversalBleTransportBase extends _Transport {
       'rawError="${platformError ?? 'none'}"',
     );
 
+    // During the first-time pairing reconnect loop a link drop is expected (the
+    // controller gives up before the PIN is entered). onTransportFault would
+    // close the transport IRREVERSIBLY (bytesStream closed, isActive=false), so
+    // it must not run here: just mark the link down and wake the setup awaits so
+    // open() can reconnect and retry. Keep _connectionOwner/callbacks intact so a
+    // user Cancel still routes through _abortConnect and the reconnect can reuse
+    // them.
+    if (_inPairingLoop && !wasDisconnecting) {
+      _link = _BleLinkState.disconnected;
+      _rpcSessionActive = false;
+      final signal = _disconnectSignal;
+      _disconnectSignal = null;
+      _fireOnce(signal);
+      _fireOnce(_setupGuard);
+      LogService.log(
+        '[BLE] pairing-phase link drop; reconnecting (transport kept alive)',
+      );
+      return;
+    }
+
     _markBleDisconnected();
     if (!wasDisconnecting) {
       onTransportFault(FlipperTransportError('BLE $reason [$cause] ($diagnostics)'));
     }
+  }
+
+  // True while open()'s first-time pairing reconnect loop is running. A link
+  // drop in this window is recoverable (reconnect + retry), not a fatal fault.
+  bool get _inPairingLoop {
+    final p = _pairingAbort;
+    return p != null && !p.isCompleted;
   }
 
   // Decodes the CoreBluetooth localizedDescription (CBErrorDomain /
