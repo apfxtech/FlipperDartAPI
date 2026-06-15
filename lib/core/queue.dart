@@ -9,6 +9,7 @@ class _QueuedRequest implements Comparable<_QueuedRequest> {
   final int seq;
   final void Function()? onSent;
   final void Function(Object error)? onError;
+  final bool interleavable;
   bool _settled = false;
 
   _QueuedRequest({
@@ -17,6 +18,7 @@ class _QueuedRequest implements Comparable<_QueuedRequest> {
     required this.seq,
     this.onSent,
     this.onError,
+    this.interleavable = false,
   });
 
   void markSent() {

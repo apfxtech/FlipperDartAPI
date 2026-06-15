@@ -264,6 +264,8 @@ extension FlipperStorageApi on FlipperClient {
       'rpcChunk=$rpcChunkSize',
     );
 
+    final pingPace = _transport is! _UniversalBleTransportBase;
+
     // Returns true when the upload was cancelled mid-stream (the firmware
     // still received a valid final frame and replied with its ACK).
     Future<bool> upload() async {
@@ -306,6 +308,15 @@ extension FlipperStorageApi on FlipperClient {
             frameIndex++;
             if (total > 0) onProgress?.call(offset / total);
             if (!hasNext) break;
+
+            if (pingPace && frameIndex % 16 == 0) {
+              await callRpcFrames(
+                Main(systemPingRequest: PingRequest()),
+                timeout: const Duration(seconds: 15),
+                priority: FlipperRequestPriority.rightNow,
+                interleavable: true,
+              );
+            }
           }
           LogService.log('[Storage] $frameIndex frames sent, awaiting ACK');
         },

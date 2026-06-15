@@ -976,6 +976,7 @@ class FlipperClient {
     FlipperRequestPriority priority = FlipperRequestPriority.defaultPriority,
     void Function(Main frame)? onFrame,
     bool retainFrames = true,
+    bool interleavable = false,
   }) async {
     if (_mode != FlipperMode.rpc) {
       await switchToRpcMode();
@@ -995,6 +996,7 @@ class FlipperClient {
         frame: request,
         priority: priority,
         seq: _requestSeq++,
+        interleavable: interleavable,
         onSent: () {
           pending.started = true;
           pending.rearmTimeout();
@@ -1251,7 +1253,7 @@ class FlipperClient {
     final lockedId = _txGroupCommandId;
     if (lockedId != null) {
       final idx = _requestQueue.indexWhere(
-        (r) => r.frame.commandId == lockedId,
+        (r) => r.frame.commandId == lockedId || r.interleavable,
       );
       if (idx < 0) return null;
       return _requestQueue.removeAt(idx);
@@ -1263,7 +1265,9 @@ class FlipperClient {
     if (_requestQueue.isEmpty) return false;
     final lockedId = _txGroupCommandId;
     if (lockedId == null) return true;
-    return _requestQueue.any((r) => r.frame.commandId == lockedId);
+    return _requestQueue.any(
+      (r) => r.frame.commandId == lockedId || r.interleavable,
+    );
   }
 
   // The only writer in RPC mode. One frame is on the wire at a time; after
