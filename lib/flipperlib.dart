@@ -3,6 +3,8 @@ export 'flipper_client.dart';
 export 'device/discovered.dart';
 export 'log_service.dart';
 export 'connect_error.dart';
+export 'dfu/dfu_detector.dart';
+export 'dfu/recovery_runner.dart';
 
 import 'flipper_client.dart';
 
