@@ -8,7 +8,8 @@ extension FlipperSystemApi on FlipperClient {
   }) {
     return callRpc(
       Main(systemPingRequest: request),
-      (frame) => frame.hasSystemPingResponse() ? frame.systemPingResponse : null,
+      (frame) =>
+          frame.hasSystemPingResponse() ? frame.systemPingResponse : null,
       timeout: timeout,
       priority: priority,
     );
@@ -82,30 +83,6 @@ extension FlipperSystemApi on FlipperClient {
     );
   }
 
-  Future<List<Main>> reboot(
-    RebootRequest request, {
-    Duration timeout = const Duration(seconds: 8),
-    FlipperRequestPriority priority = FlipperRequestPriority.foreground,
-  }) {
-    return callRpcFrames(
-      Main(systemRebootRequest: request),
-      timeout: timeout,
-      priority: priority,
-    );
-  }
-
-  Future<void> rebootAndDisconnect(RebootRequest request) async {
-    unawaited(
-      callRpcFrames(
-        Main(systemRebootRequest: request),
-        timeout: const Duration(seconds: 5),
-        priority: FlipperRequestPriority.rightNow,
-      ).catchError((_) => <Main>[]),
-    );
-    await Future<void>.delayed(const Duration(milliseconds: 250));
-    await disconnect();
-  }
-
   Future<List<Main>> update(
     UpdateRequest request, {
     Duration timeout = const Duration(seconds: 8),
@@ -116,18 +93,6 @@ extension FlipperSystemApi on FlipperClient {
       timeout: timeout,
       priority: priority,
     );
-  }
-
-  Future<void> updateAndDisconnect(UpdateRequest request) async {
-    unawaited(
-      callRpcFrames(
-        Main(systemUpdateRequest: request),
-        timeout: const Duration(seconds: 5),
-        priority: FlipperRequestPriority.rightNow,
-      ).catchError((_) => <Main>[]),
-    );
-    await Future<void>.delayed(const Duration(milliseconds: 250));
-    await disconnect();
   }
 
   Future<FlipperRpcBatch<UpdateResponse>> updateStatus({
@@ -153,6 +118,23 @@ extension FlipperSystemApi on FlipperClient {
       timeout: timeout,
       priority: priority,
     );
+  }
+
+  Future<void> reboot(RebootRequest request) async {
+    unawaited(
+      callRpcFrames(
+        Main(systemRebootRequest: request),
+        timeout: const Duration(seconds: 5),
+        priority: FlipperRequestPriority.rightNow,
+      ).catchError((_) => <Main>[]),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    await disconnect();
+  }
+
+  Future<void> runUpdate(UpdateRequest request) async {
+    await update(request);
+    await reboot(RebootRequest(mode: RebootRequest_RebootMode.UPDATE));
   }
 
   Future<List<Main>> playAudiovisualAlert(
