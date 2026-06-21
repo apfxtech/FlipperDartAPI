@@ -44,6 +44,8 @@ const CommandStatus$json = {
     {'1': 'ERROR_VIRTUAL_DISPLAY_NOT_STARTED', '2': 20},
     {'1': 'ERROR_GPIO_MODE_INCORRECT', '2': 58},
     {'1': 'ERROR_GPIO_UNKNOWN_PIN_MODE', '2': 59},
+    {'1': 'ERROR_GPS_NOT_SUPPORTED', '2': 60},
+    {'1': 'ERROR_GPS_NO_PERMISSION', '2': 61},
   ],
 };
 
@@ -62,7 +64,8 @@ final $typed_data.Uint8List commandStatusDescriptor = $convert.base64Decode(
     'EhcKE0VSUk9SX0FQUF9DTURfRVJST1IQFhIpCiVFUlJPUl9WSVJUVUFMX0RJU1BMQVlfQUxSRU'
     'FEWV9TVEFSVEVEEBMSJQohRVJST1JfVklSVFVBTF9ESVNQTEFZX05PVF9TVEFSVEVEEBQSHQoZ'
     'RVJST1JfR1BJT19NT0RFX0lOQ09SUkVDVBA6Eh8KG0VSUk9SX0dQSU9fVU5LTk9XTl9QSU5fTU'
-    '9ERRA7');
+    '9ERRA7EhsKF0VSUk9SX0dQU19OT1RfU1VQUE9SVEVEEDwSGwoXRVJST1JfR1BTX05PX1BFUk1J'
+    'U1NJT04QPQ==');
 
 @$core.Deprecated('Use emptyDescriptor instead')
 const Empty$json = {
@@ -744,6 +747,42 @@ const Main$json = {
       '9': 0,
       '10': 'desktopStatus'
     },
+    {
+      '1': 'gps_stream_start_request',
+      '3': 76,
+      '4': 1,
+      '5': 11,
+      '6': '.PB_Gps.StreamStartRequest',
+      '9': 0,
+      '10': 'gpsStreamStartRequest'
+    },
+    {
+      '1': 'gps_stream_stop_request',
+      '3': 77,
+      '4': 1,
+      '5': 11,
+      '6': '.PB_Gps.StreamStopRequest',
+      '9': 0,
+      '10': 'gpsStreamStopRequest'
+    },
+    {
+      '1': 'gps_location_request',
+      '3': 78,
+      '4': 1,
+      '5': 11,
+      '6': '.PB_Gps.LocationRequest',
+      '9': 0,
+      '10': 'gpsLocationRequest'
+    },
+    {
+      '1': 'gps_location',
+      '3': 79,
+      '4': 1,
+      '5': 11,
+      '6': '.PB_Gps.Location',
+      '9': 0,
+      '10': 'gpsLocation'
+    },
   ],
   '8': [
     {'1': 'content'},
@@ -864,7 +903,13 @@ final $typed_data.Uint8List mainDescriptor = $convert.base64Decode(
     '1kZXNrdG9wU3RhdHVzU3Vic2NyaWJlUmVxdWVzdBJzCiJkZXNrdG9wX3N0YXR1c191bnN1YnNj'
     'cmliZV9yZXF1ZXN0GEUgASgLMiQuUEJfRGVza3RvcC5TdGF0dXNVbnN1YnNjcmliZVJlcXVlc3'
     'RIAFIfZGVza3RvcFN0YXR1c1Vuc3Vic2NyaWJlUmVxdWVzdBI7Cg5kZXNrdG9wX3N0YXR1cxhG'
-    'IAEoCzISLlBCX0Rlc2t0b3AuU3RhdHVzSABSDWRlc2t0b3BTdGF0dXNCCQoHY29udGVudA==');
+    'IAEoCzISLlBCX0Rlc2t0b3AuU3RhdHVzSABSDWRlc2t0b3BTdGF0dXMSVQoYZ3BzX3N0cmVhbV'
+    '9zdGFydF9yZXF1ZXN0GEwgASgLMhouUEJfR3BzLlN0cmVhbVN0YXJ0UmVxdWVzdEgAUhVncHNT'
+    'dHJlYW1TdGFydFJlcXVlc3QSUgoXZ3BzX3N0cmVhbV9zdG9wX3JlcXVlc3QYTSABKAsyGS5QQl'
+    '9HcHMuU3RyZWFtU3RvcFJlcXVlc3RIAFIUZ3BzU3RyZWFtU3RvcFJlcXVlc3QSSwoUZ3BzX2xv'
+    'Y2F0aW9uX3JlcXVlc3QYTiABKAsyFy5QQl9HcHMuTG9jYXRpb25SZXF1ZXN0SABSEmdwc0xvY2'
+    'F0aW9uUmVxdWVzdBI1CgxncHNfbG9jYXRpb24YTyABKAsyEC5QQl9HcHMuTG9jYXRpb25IAFIL'
+    'Z3BzTG9jYXRpb25CCQoHY29udGVudA==');
 
 @$core.Deprecated('Use regionDescriptor instead')
 const Region$json = {

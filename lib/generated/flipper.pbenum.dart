@@ -79,6 +79,12 @@ class CommandStatus extends $pb.ProtobufEnum {
   static const CommandStatus ERROR_GPIO_UNKNOWN_PIN_MODE =
       CommandStatus._(59, _omitEnumNames ? '' : 'ERROR_GPIO_UNKNOWN_PIN_MODE');
 
+  /// *< GPS Errors
+  static const CommandStatus ERROR_GPS_NOT_SUPPORTED =
+      CommandStatus._(60, _omitEnumNames ? '' : 'ERROR_GPS_NOT_SUPPORTED');
+  static const CommandStatus ERROR_GPS_NO_PERMISSION =
+      CommandStatus._(61, _omitEnumNames ? '' : 'ERROR_GPS_NO_PERMISSION');
+
   static const $core.List<CommandStatus> values = <CommandStatus>[
     OK,
     ERROR,
@@ -105,6 +111,8 @@ class CommandStatus extends $pb.ProtobufEnum {
     ERROR_VIRTUAL_DISPLAY_NOT_STARTED,
     ERROR_GPIO_MODE_INCORRECT,
     ERROR_GPIO_UNKNOWN_PIN_MODE,
+    ERROR_GPS_NOT_SUPPORTED,
+    ERROR_GPS_NO_PERMISSION,
   ];
 
   static final $core.Map<$core.int, CommandStatus> _byValue =

@@ -18,6 +18,7 @@ import 'application.pb.dart' as $2;
 import 'desktop.pb.dart' as $6;
 import 'flipper.pbenum.dart';
 import 'gpio.pb.dart' as $4;
+import 'gps.pb.dart' as $7;
 import 'gui.pb.dart' as $3;
 import 'property.pb.dart' as $5;
 import 'storage.pb.dart' as $1;
@@ -178,6 +179,10 @@ enum Main_Content {
   gpioGetOtgModeResponse,
   gpioSetOtgMode,
   appButtonPressReleaseRequest,
+  gpsStreamStartRequest,
+  gpsStreamStopRequest,
+  gpsLocationRequest,
+  gpsLocation,
   notSet
 }
 
@@ -258,6 +263,10 @@ class Main extends $pb.GeneratedMessage {
     $4.GetOtgModeResponse? gpioGetOtgModeResponse,
     $4.SetOtgMode? gpioSetOtgMode,
     $2.AppButtonPressReleaseRequest? appButtonPressReleaseRequest,
+    $7.StreamStartRequest? gpsStreamStartRequest,
+    $7.StreamStopRequest? gpsStreamStopRequest,
+    $7.LocationRequest? gpsLocationRequest,
+    $7.Location? gpsLocation,
   }) {
     final result = create();
     if (commandId != null) result.commandId = commandId;
@@ -393,6 +402,13 @@ class Main extends $pb.GeneratedMessage {
     if (gpioSetOtgMode != null) result.gpioSetOtgMode = gpioSetOtgMode;
     if (appButtonPressReleaseRequest != null)
       result.appButtonPressReleaseRequest = appButtonPressReleaseRequest;
+    if (gpsStreamStartRequest != null)
+      result.gpsStreamStartRequest = gpsStreamStartRequest;
+    if (gpsStreamStopRequest != null)
+      result.gpsStreamStopRequest = gpsStreamStopRequest;
+    if (gpsLocationRequest != null)
+      result.gpsLocationRequest = gpsLocationRequest;
+    if (gpsLocation != null) result.gpsLocation = gpsLocation;
     return result;
   }
 
@@ -478,6 +494,10 @@ class Main extends $pb.GeneratedMessage {
     73: Main_Content.gpioGetOtgModeResponse,
     74: Main_Content.gpioSetOtgMode,
     75: Main_Content.appButtonPressReleaseRequest,
+    76: Main_Content.gpsStreamStartRequest,
+    77: Main_Content.gpsStreamStopRequest,
+    78: Main_Content.gpsLocationRequest,
+    79: Main_Content.gpsLocation,
     0: Main_Content.notSet
   };
   static final $pb.BuilderInfo _i = $pb.BuilderInfo(
@@ -556,7 +576,11 @@ class Main extends $pb.GeneratedMessage {
       72,
       73,
       74,
-      75
+      75,
+      76,
+      77,
+      78,
+      79
     ])
     ..aI(1, _omitFieldNames ? '' : 'commandId', fieldType: $pb.PbFieldType.OU3)
     ..aE<CommandStatus>(2, _omitFieldNames ? '' : 'commandStatus',
@@ -738,6 +762,16 @@ class Main extends $pb.GeneratedMessage {
     ..aOM<$2.AppButtonPressReleaseRequest>(
         75, _omitFieldNames ? '' : 'appButtonPressReleaseRequest',
         subBuilder: $2.AppButtonPressReleaseRequest.create)
+    ..aOM<$7.StreamStartRequest>(
+        76, _omitFieldNames ? '' : 'gpsStreamStartRequest',
+        subBuilder: $7.StreamStartRequest.create)
+    ..aOM<$7.StreamStopRequest>(
+        77, _omitFieldNames ? '' : 'gpsStreamStopRequest',
+        subBuilder: $7.StreamStopRequest.create)
+    ..aOM<$7.LocationRequest>(78, _omitFieldNames ? '' : 'gpsLocationRequest',
+        subBuilder: $7.LocationRequest.create)
+    ..aOM<$7.Location>(79, _omitFieldNames ? '' : 'gpsLocation',
+        subBuilder: $7.Location.create)
     ..hasRequiredFields = false;
 
   @$core.Deprecated('See https://github.com/google/protobuf.dart/issues/998.')
@@ -830,6 +864,10 @@ class Main extends $pb.GeneratedMessage {
   @$pb.TagNumber(73)
   @$pb.TagNumber(74)
   @$pb.TagNumber(75)
+  @$pb.TagNumber(76)
+  @$pb.TagNumber(77)
+  @$pb.TagNumber(78)
+  @$pb.TagNumber(79)
   Main_Content whichContent() => _Main_ContentByTag[$_whichOneof(0)]!;
   @$pb.TagNumber(4)
   @$pb.TagNumber(5)
@@ -903,6 +941,10 @@ class Main extends $pb.GeneratedMessage {
   @$pb.TagNumber(73)
   @$pb.TagNumber(74)
   @$pb.TagNumber(75)
+  @$pb.TagNumber(76)
+  @$pb.TagNumber(77)
+  @$pb.TagNumber(78)
+  @$pb.TagNumber(79)
   void clearContent() => $_clearField($_whichOneof(0));
 
   @$pb.TagNumber(1)
@@ -1764,6 +1806,51 @@ class Main extends $pb.GeneratedMessage {
   @$pb.TagNumber(75)
   $2.AppButtonPressReleaseRequest ensureAppButtonPressReleaseRequest() =>
       $_ensure(74);
+
+  @$pb.TagNumber(76)
+  $7.StreamStartRequest get gpsStreamStartRequest => $_getN(75);
+  @$pb.TagNumber(76)
+  set gpsStreamStartRequest($7.StreamStartRequest value) =>
+      $_setField(76, value);
+  @$pb.TagNumber(76)
+  $core.bool hasGpsStreamStartRequest() => $_has(75);
+  @$pb.TagNumber(76)
+  void clearGpsStreamStartRequest() => $_clearField(76);
+  @$pb.TagNumber(76)
+  $7.StreamStartRequest ensureGpsStreamStartRequest() => $_ensure(75);
+
+  @$pb.TagNumber(77)
+  $7.StreamStopRequest get gpsStreamStopRequest => $_getN(76);
+  @$pb.TagNumber(77)
+  set gpsStreamStopRequest($7.StreamStopRequest value) => $_setField(77, value);
+  @$pb.TagNumber(77)
+  $core.bool hasGpsStreamStopRequest() => $_has(76);
+  @$pb.TagNumber(77)
+  void clearGpsStreamStopRequest() => $_clearField(77);
+  @$pb.TagNumber(77)
+  $7.StreamStopRequest ensureGpsStreamStopRequest() => $_ensure(76);
+
+  @$pb.TagNumber(78)
+  $7.LocationRequest get gpsLocationRequest => $_getN(77);
+  @$pb.TagNumber(78)
+  set gpsLocationRequest($7.LocationRequest value) => $_setField(78, value);
+  @$pb.TagNumber(78)
+  $core.bool hasGpsLocationRequest() => $_has(77);
+  @$pb.TagNumber(78)
+  void clearGpsLocationRequest() => $_clearField(78);
+  @$pb.TagNumber(78)
+  $7.LocationRequest ensureGpsLocationRequest() => $_ensure(77);
+
+  @$pb.TagNumber(79)
+  $7.Location get gpsLocation => $_getN(78);
+  @$pb.TagNumber(79)
+  set gpsLocation($7.Location value) => $_setField(79, value);
+  @$pb.TagNumber(79)
+  $core.bool hasGpsLocation() => $_has(78);
+  @$pb.TagNumber(79)
+  void clearGpsLocation() => $_clearField(79);
+  @$pb.TagNumber(79)
+  $7.Location ensureGpsLocation() => $_ensure(78);
 }
 
 class Region_Band extends $pb.GeneratedMessage {
