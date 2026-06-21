@@ -50,19 +50,19 @@ final $typed_data.Uint8List locationRequestDescriptor =
 const Location$json = {
   '1': 'Location',
   '2': [
-    {'1': 'latitude', '3': 1, '4': 1, '5': 1, '10': 'latitude'},
-    {'1': 'longitude', '3': 2, '4': 1, '5': 1, '10': 'longitude'},
-    {'1': 'heading', '3': 3, '4': 1, '5': 2, '10': 'heading'},
-    {'1': 'speed', '3': 4, '4': 1, '5': 2, '10': 'speed'},
-    {'1': 'altitude', '3': 5, '4': 1, '5': 2, '10': 'altitude'},
-    {'1': 'accuracy', '3': 6, '4': 1, '5': 2, '10': 'accuracy'},
+    {'1': 'latitude', '3': 1, '4': 1, '5': 17, '10': 'latitude'},
+    {'1': 'longitude', '3': 2, '4': 1, '5': 17, '10': 'longitude'},
+    {'1': 'heading', '3': 3, '4': 1, '5': 13, '10': 'heading'},
+    {'1': 'speed', '3': 4, '4': 1, '5': 13, '10': 'speed'},
+    {'1': 'altitude', '3': 5, '4': 1, '5': 17, '10': 'altitude'},
+    {'1': 'accuracy', '3': 6, '4': 1, '5': 13, '10': 'accuracy'},
     {'1': 'satellites', '3': 7, '4': 1, '5': 13, '10': 'satellites'},
   ],
 };
 
 /// Descriptor for `Location`. Decode as a `google.protobuf.DescriptorProto`.
 final $typed_data.Uint8List locationDescriptor = $convert.base64Decode(
-    'CghMb2NhdGlvbhIaCghsYXRpdHVkZRgBIAEoAVIIbGF0aXR1ZGUSHAoJbG9uZ2l0dWRlGAIgAS'
-    'gBUglsb25naXR1ZGUSGAoHaGVhZGluZxgDIAEoAlIHaGVhZGluZxIUCgVzcGVlZBgEIAEoAlIF'
-    'c3BlZWQSGgoIYWx0aXR1ZGUYBSABKAJSCGFsdGl0dWRlEhoKCGFjY3VyYWN5GAYgASgCUghhY2'
+    'CghMb2NhdGlvbhIaCghsYXRpdHVkZRgBIAEoEVIIbGF0aXR1ZGUSHAoJbG9uZ2l0dWRlGAIgAS'
+    'gRUglsb25naXR1ZGUSGAoHaGVhZGluZxgDIAEoDVIHaGVhZGluZxIUCgVzcGVlZBgEIAEoDVIF'
+    'c3BlZWQSGgoIYWx0aXR1ZGUYBSABKBFSCGFsdGl0dWRlEhoKCGFjY3VyYWN5GAYgASgNUghhY2'
     'N1cmFjeRIeCgpzYXRlbGxpdGVzGAcgASgNUgpzYXRlbGxpdGVz');

@@ -53,19 +53,32 @@ class FlipperGpsResponder {
   final GpsLocationProvider _provider;
 
   StreamSubscription<Main>? _notifications;
+  StreamSubscription<FlipperConnectionState>? _connection;
   StreamSubscription<GpsFix>? _stream;
 
   /// Starts listening for GPS requests. Idempotent.
   void attach() {
     _notifications ??= _client.notificationStream.listen(_onNotification);
+    // A dropped link means the Flipper's stream request is gone; stop pushing
+    // into a dead session instead of burning the phone's GPS forever.
+    _connection ??= _client.connectionStream.listen(_onConnection);
   }
 
   /// Stops the responder and any active location stream.
   Future<void> detach() async {
     await _stopStream();
-    final sub = _notifications;
+    final notifications = _notifications;
+    final connection = _connection;
     _notifications = null;
-    await sub?.cancel();
+    _connection = null;
+    await notifications?.cancel();
+    await connection?.cancel();
+  }
+
+  void _onConnection(FlipperConnectionState state) {
+    if (!state.connected || state.mode != FlipperMode.rpc) {
+      unawaited(_stopStream());
+    }
   }
 
   void _onNotification(Main frame) {
@@ -115,24 +128,31 @@ class FlipperGpsResponder {
     await sub?.cancel();
   }
 
+  // Non-negative scaled integer, for the unsigned wire fields.
+  static int _scaleUnsigned(double value, double factor) =>
+      value.isFinite && value > 0 ? (value * factor).round() : 0;
+
   Future<void> _sendLocation(GpsFix fix) async {
+    // Wire fields are integer fixed-point (see gps.proto): degrees*1e7,
+    // centimeters, mm/s, degrees*100, millimeters.
+    final location = Location(
+      latitude: (fix.latitude * 1e7).round(),
+      longitude: (fix.longitude * 1e7).round(),
+      altitude: (fix.altitude * 100).round(),
+      speed: _scaleUnsigned(fix.speed, 1000),
+      heading: _scaleUnsigned(fix.heading, 100),
+      accuracy: _scaleUnsigned(fix.accuracy, 1000),
+      satellites: fix.satellites,
+    );
     try {
       await _client.sendRpc(
-        Main(
-          gpsLocation: Location(
-            latitude: fix.latitude,
-            longitude: fix.longitude,
-            heading: fix.heading,
-            speed: fix.speed,
-            altitude: fix.altitude,
-            accuracy: fix.accuracy,
-            satellites: fix.satellites,
-          ),
-        ),
+        Main(gpsLocation: location),
         priority: FlipperRequestPriority.background,
       );
     } catch (error) {
-      LogService.log('[GPS] failed to send location: $error');
+      // The link is gone; stop the stream rather than retrying every tick.
+      LogService.log('[GPS] failed to send location, stopping stream: $error');
+      await _stopStream();
     }
   }
 

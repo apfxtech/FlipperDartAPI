@@ -148,12 +148,12 @@ class LocationRequest extends $pb.GeneratedMessage {
 
 class Location extends $pb.GeneratedMessage {
   factory Location({
-    $core.double? latitude,
-    $core.double? longitude,
-    $core.double? heading,
-    $core.double? speed,
-    $core.double? altitude,
-    $core.double? accuracy,
+    $core.int? latitude,
+    $core.int? longitude,
+    $core.int? heading,
+    $core.int? speed,
+    $core.int? altitude,
+    $core.int? accuracy,
     $core.int? satellites,
   }) {
     final result = create();
@@ -180,12 +180,12 @@ class Location extends $pb.GeneratedMessage {
       _omitMessageNames ? '' : 'Location',
       package: const $pb.PackageName(_omitMessageNames ? '' : 'PB_Gps'),
       createEmptyInstance: create)
-    ..aD(1, _omitFieldNames ? '' : 'latitude')
-    ..aD(2, _omitFieldNames ? '' : 'longitude')
-    ..aD(3, _omitFieldNames ? '' : 'heading', fieldType: $pb.PbFieldType.OF)
-    ..aD(4, _omitFieldNames ? '' : 'speed', fieldType: $pb.PbFieldType.OF)
-    ..aD(5, _omitFieldNames ? '' : 'altitude', fieldType: $pb.PbFieldType.OF)
-    ..aD(6, _omitFieldNames ? '' : 'accuracy', fieldType: $pb.PbFieldType.OF)
+    ..aI(1, _omitFieldNames ? '' : 'latitude', fieldType: $pb.PbFieldType.OS3)
+    ..aI(2, _omitFieldNames ? '' : 'longitude', fieldType: $pb.PbFieldType.OS3)
+    ..aI(3, _omitFieldNames ? '' : 'heading', fieldType: $pb.PbFieldType.OU3)
+    ..aI(4, _omitFieldNames ? '' : 'speed', fieldType: $pb.PbFieldType.OU3)
+    ..aI(5, _omitFieldNames ? '' : 'altitude', fieldType: $pb.PbFieldType.OS3)
+    ..aI(6, _omitFieldNames ? '' : 'accuracy', fieldType: $pb.PbFieldType.OU3)
     ..aI(7, _omitFieldNames ? '' : 'satellites', fieldType: $pb.PbFieldType.OU3)
     ..hasRequiredFields = false;
 
@@ -208,54 +208,54 @@ class Location extends $pb.GeneratedMessage {
   static Location? _defaultInstance;
 
   @$pb.TagNumber(1)
-  $core.double get latitude => $_getN(0);
+  $core.int get latitude => $_getIZ(0);
   @$pb.TagNumber(1)
-  set latitude($core.double value) => $_setDouble(0, value);
+  set latitude($core.int value) => $_setSignedInt32(0, value);
   @$pb.TagNumber(1)
   $core.bool hasLatitude() => $_has(0);
   @$pb.TagNumber(1)
   void clearLatitude() => $_clearField(1);
 
   @$pb.TagNumber(2)
-  $core.double get longitude => $_getN(1);
+  $core.int get longitude => $_getIZ(1);
   @$pb.TagNumber(2)
-  set longitude($core.double value) => $_setDouble(1, value);
+  set longitude($core.int value) => $_setSignedInt32(1, value);
   @$pb.TagNumber(2)
   $core.bool hasLongitude() => $_has(1);
   @$pb.TagNumber(2)
   void clearLongitude() => $_clearField(2);
 
   @$pb.TagNumber(3)
-  $core.double get heading => $_getN(2);
+  $core.int get heading => $_getIZ(2);
   @$pb.TagNumber(3)
-  set heading($core.double value) => $_setFloat(2, value);
+  set heading($core.int value) => $_setUnsignedInt32(2, value);
   @$pb.TagNumber(3)
   $core.bool hasHeading() => $_has(2);
   @$pb.TagNumber(3)
   void clearHeading() => $_clearField(3);
 
   @$pb.TagNumber(4)
-  $core.double get speed => $_getN(3);
+  $core.int get speed => $_getIZ(3);
   @$pb.TagNumber(4)
-  set speed($core.double value) => $_setFloat(3, value);
+  set speed($core.int value) => $_setUnsignedInt32(3, value);
   @$pb.TagNumber(4)
   $core.bool hasSpeed() => $_has(3);
   @$pb.TagNumber(4)
   void clearSpeed() => $_clearField(4);
 
   @$pb.TagNumber(5)
-  $core.double get altitude => $_getN(4);
+  $core.int get altitude => $_getIZ(4);
   @$pb.TagNumber(5)
-  set altitude($core.double value) => $_setFloat(4, value);
+  set altitude($core.int value) => $_setSignedInt32(4, value);
   @$pb.TagNumber(5)
   $core.bool hasAltitude() => $_has(4);
   @$pb.TagNumber(5)
   void clearAltitude() => $_clearField(5);
 
   @$pb.TagNumber(6)
-  $core.double get accuracy => $_getN(5);
+  $core.int get accuracy => $_getIZ(5);
   @$pb.TagNumber(6)
-  set accuracy($core.double value) => $_setFloat(5, value);
+  set accuracy($core.int value) => $_setUnsignedInt32(5, value);
   @$pb.TagNumber(6)
   $core.bool hasAccuracy() => $_has(5);
   @$pb.TagNumber(6)
