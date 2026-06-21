@@ -55,6 +55,7 @@ class FlipperGpsResponder {
   StreamSubscription<Main>? _notifications;
   StreamSubscription<FlipperConnectionState>? _connection;
   StreamSubscription<GpsFix>? _stream;
+  int? _streamFrequency;
 
   /// Starts listening for GPS requests. Idempotent.
   void attach() {
@@ -92,9 +93,13 @@ class FlipperGpsResponder {
   }
 
   Future<void> _onStreamStart(int frequency) async {
-    if (!await _ensureReady()) return;
     final hz = frequency.clamp(minFrequency, maxFrequency);
+    // The Flipper re-sends StreamStart every second as a link check; ignore it
+    // while an identical stream is already running.
+    if (_stream != null && _streamFrequency == hz) return;
+    if (!await _ensureReady()) return;
     await _stopStream();
+    _streamFrequency = hz;
     _stream = _provider.watch(hz).listen(
       (fix) => unawaited(_sendLocation(fix)),
       onError: (Object error) =>
@@ -123,6 +128,7 @@ class FlipperGpsResponder {
   }
 
   Future<void> _stopStream() async {
+    _streamFrequency = null;
     final sub = _stream;
     _stream = null;
     await sub?.cancel();
