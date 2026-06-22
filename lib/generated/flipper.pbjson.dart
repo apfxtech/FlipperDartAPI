@@ -46,6 +46,8 @@ const CommandStatus$json = {
     {'1': 'ERROR_GPIO_UNKNOWN_PIN_MODE', '2': 59},
     {'1': 'ERROR_GPS_NOT_SUPPORTED', '2': 60},
     {'1': 'ERROR_GPS_NO_PERMISSION', '2': 61},
+    {'1': 'ERROR_GPS_DISABLED', '2': 62},
+    {'1': 'ERROR_GPS_UNKNOWN', '2': 63},
   ],
 };
 
@@ -65,7 +67,7 @@ final $typed_data.Uint8List commandStatusDescriptor = $convert.base64Decode(
     'FEWV9TVEFSVEVEEBMSJQohRVJST1JfVklSVFVBTF9ESVNQTEFZX05PVF9TVEFSVEVEEBQSHQoZ'
     'RVJST1JfR1BJT19NT0RFX0lOQ09SUkVDVBA6Eh8KG0VSUk9SX0dQSU9fVU5LTk9XTl9QSU5fTU'
     '9ERRA7EhsKF0VSUk9SX0dQU19OT1RfU1VQUE9SVEVEEDwSGwoXRVJST1JfR1BTX05PX1BFUk1J'
-    'U1NJT04QPQ==');
+    'U1NJT04QPRIWChJFUlJPUl9HUFNfRElTQUJMRUQQPhIVChFFUlJPUl9HUFNfVU5LTk9XThA/');
 
 @$core.Deprecated('Use emptyDescriptor instead')
 const Empty$json = {

@@ -84,6 +84,10 @@ class CommandStatus extends $pb.ProtobufEnum {
       CommandStatus._(60, _omitEnumNames ? '' : 'ERROR_GPS_NOT_SUPPORTED');
   static const CommandStatus ERROR_GPS_NO_PERMISSION =
       CommandStatus._(61, _omitEnumNames ? '' : 'ERROR_GPS_NO_PERMISSION');
+  static const CommandStatus ERROR_GPS_DISABLED =
+      CommandStatus._(62, _omitEnumNames ? '' : 'ERROR_GPS_DISABLED');
+  static const CommandStatus ERROR_GPS_UNKNOWN =
+      CommandStatus._(63, _omitEnumNames ? '' : 'ERROR_GPS_UNKNOWN');
 
   static const $core.List<CommandStatus> values = <CommandStatus>[
     OK,
@@ -113,6 +117,8 @@ class CommandStatus extends $pb.ProtobufEnum {
     ERROR_GPIO_UNKNOWN_PIN_MODE,
     ERROR_GPS_NOT_SUPPORTED,
     ERROR_GPS_NO_PERMISSION,
+    ERROR_GPS_DISABLED,
+    ERROR_GPS_UNKNOWN,
   ];
 
   static final $core.Map<$core.int, CommandStatus> _byValue =

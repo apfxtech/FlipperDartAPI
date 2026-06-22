@@ -1,6 +1,5 @@
 part of '../flipper_client.dart';
 
-/// A single location sample taken from the host platform.
 class GpsFix {
   const GpsFix({
     required this.latitude,
@@ -21,28 +20,23 @@ class GpsFix {
   final int satellites;
 }
 
-/// Platform location source. The host app supplies a concrete implementation
-/// (e.g. backed by geolocator); flipperlib stays platform-agnostic.
+enum GpsReadiness {
+  ready,
+  notSupported,
+  disabled,
+  permissionDenied,
+  unknown,
+}
+
 abstract class GpsLocationProvider {
-  /// Whether this device can report location at all.
-  bool get isSupported;
 
-  /// Requests/checks location permission. Returns true when granted.
-  Future<bool> ensurePermission();
+  Future<GpsReadiness> ensureReady();
 
-  /// Continuous location updates at roughly [frequencyHz] samples per second.
   Stream<GpsFix> watch(int frequencyHz);
 
-  /// A single current location, or null when it can't be determined.
   Future<GpsFix?> current();
 }
 
-/// Answers the Flipper's GPS requests with the phone's location.
-///
-/// A custom firmware app pushes StreamStart / StreamStop / Location requests as
-/// command_id == 0 broadcasts; this responder turns them into [Location]
-/// packets sent back through the normal RPC queue and flow control, or replies
-/// with an error status when the device has no location capability/permission.
 class FlipperGpsResponder {
   FlipperGpsResponder(this._client, this._provider);
 
@@ -56,16 +50,10 @@ class FlipperGpsResponder {
   StreamSubscription<FlipperConnectionState>? _connection;
   StreamSubscription<GpsFix>? _stream;
   int? _streamFrequency;
-
-  /// Starts listening for GPS requests. Idempotent.
   void attach() {
     _notifications ??= _client.notificationStream.listen(_onNotification);
-    // A dropped link means the Flipper's stream request is gone; stop pushing
-    // into a dead session instead of burning the phone's GPS forever.
     _connection ??= _client.connectionStream.listen(_onConnection);
   }
-
-  /// Stops the responder and any active location stream.
   Future<void> detach() async {
     await _stopStream();
     final notifications = _notifications;
@@ -94,8 +82,6 @@ class FlipperGpsResponder {
 
   Future<void> _onStreamStart(int frequency) async {
     final hz = frequency.clamp(minFrequency, maxFrequency);
-    // The Flipper re-sends StreamStart every second as a link check; ignore it
-    // while an identical stream is already running.
     if (_stream != null && _streamFrequency == hz) return;
     if (!await _ensureReady()) return;
     await _stopStream();
@@ -113,18 +99,30 @@ class FlipperGpsResponder {
     if (fix != null) await _sendLocation(fix);
   }
 
-  // Validates capability/permission once, sending the matching error status to
-  // the Flipper when not satisfied. Returns true only when streaming may start.
   Future<bool> _ensureReady() async {
-    if (!_provider.isSupported) {
-      await _sendError(CommandStatus.ERROR_GPS_NOT_SUPPORTED);
-      return false;
+    GpsReadiness readiness;
+    try {
+      readiness = await _provider.ensureReady();
+    } catch (error) {
+      LogService.log('[GPS] readiness check failed: $error');
+      readiness = GpsReadiness.unknown;
     }
-    if (!await _provider.ensurePermission()) {
-      await _sendError(CommandStatus.ERROR_GPS_NO_PERMISSION);
-      return false;
+    switch (readiness) {
+      case GpsReadiness.ready:
+        return true;
+      case GpsReadiness.notSupported:
+        await _sendError(CommandStatus.ERROR_GPS_NOT_SUPPORTED);
+        return false;
+      case GpsReadiness.disabled:
+        await _sendError(CommandStatus.ERROR_GPS_DISABLED);
+        return false;
+      case GpsReadiness.permissionDenied:
+        await _sendError(CommandStatus.ERROR_GPS_NO_PERMISSION);
+        return false;
+      case GpsReadiness.unknown:
+        await _sendError(CommandStatus.ERROR_GPS_UNKNOWN);
+        return false;
     }
-    return true;
   }
 
   Future<void> _stopStream() async {
@@ -133,14 +131,10 @@ class FlipperGpsResponder {
     _stream = null;
     await sub?.cancel();
   }
-
-  // Non-negative scaled integer, for the unsigned wire fields.
   static int _scaleUnsigned(double value, double factor) =>
       value.isFinite && value > 0 ? (value * factor).round() : 0;
 
   Future<void> _sendLocation(GpsFix fix) async {
-    // Wire fields are integer fixed-point (see gps.proto): degrees*1e7,
-    // centimeters, mm/s, degrees*100, millimeters.
     final location = Location(
       latitude: (fix.latitude * 1e7).round(),
       longitude: (fix.longitude * 1e7).round(),
@@ -156,7 +150,6 @@ class FlipperGpsResponder {
         priority: FlipperRequestPriority.background,
       );
     } catch (error) {
-      // The link is gone; stop the stream rather than retrying every tick.
       LogService.log('[GPS] failed to send location, stopping stream: $error');
       await _stopStream();
     }
@@ -174,9 +167,6 @@ class FlipperGpsResponder {
 }
 
 extension FlipperGpsApi on FlipperClient {
-  /// Attaches a [FlipperGpsResponder] that answers the Flipper's GPS requests
-  /// using [provider]. The caller owns the returned responder and should call
-  /// `detach()` when done.
   FlipperGpsResponder attachGpsResponder(GpsLocationProvider provider) {
     final responder = FlipperGpsResponder(this, provider);
     responder.attach();
