@@ -750,8 +750,80 @@ const Main$json = {
       '10': 'desktopStatus'
     },
     {
-      '1': 'gps_stream_start_request',
+      '1': 'network_connect_request',
       '3': 76,
+      '4': 1,
+      '5': 11,
+      '6': '.PB_Network.ConnectRequest',
+      '9': 0,
+      '10': 'networkConnectRequest'
+    },
+    {
+      '1': 'network_connect_response',
+      '3': 77,
+      '4': 1,
+      '5': 11,
+      '6': '.PB_Network.ConnectResponse',
+      '9': 0,
+      '10': 'networkConnectResponse'
+    },
+    {
+      '1': 'network_send_request',
+      '3': 78,
+      '4': 1,
+      '5': 11,
+      '6': '.PB_Network.SendRequest',
+      '9': 0,
+      '10': 'networkSendRequest'
+    },
+    {
+      '1': 'network_send_response',
+      '3': 79,
+      '4': 1,
+      '5': 11,
+      '6': '.PB_Network.SendResponse',
+      '9': 0,
+      '10': 'networkSendResponse'
+    },
+    {
+      '1': 'network_receive_data',
+      '3': 80,
+      '4': 1,
+      '5': 11,
+      '6': '.PB_Network.ReceiveData',
+      '9': 0,
+      '10': 'networkReceiveData'
+    },
+    {
+      '1': 'network_close_request',
+      '3': 81,
+      '4': 1,
+      '5': 11,
+      '6': '.PB_Network.CloseRequest',
+      '9': 0,
+      '10': 'networkCloseRequest'
+    },
+    {
+      '1': 'network_close_response',
+      '3': 82,
+      '4': 1,
+      '5': 11,
+      '6': '.PB_Network.CloseResponse',
+      '9': 0,
+      '10': 'networkCloseResponse'
+    },
+    {
+      '1': 'network_state_changed',
+      '3': 83,
+      '4': 1,
+      '5': 11,
+      '6': '.PB_Network.StateChanged',
+      '9': 0,
+      '10': 'networkStateChanged'
+    },
+    {
+      '1': 'gps_stream_start_request',
+      '3': 84,
       '4': 1,
       '5': 11,
       '6': '.PB_Gps.StreamStartRequest',
@@ -760,7 +832,7 @@ const Main$json = {
     },
     {
       '1': 'gps_stream_stop_request',
-      '3': 77,
+      '3': 85,
       '4': 1,
       '5': 11,
       '6': '.PB_Gps.StreamStopRequest',
@@ -769,7 +841,7 @@ const Main$json = {
     },
     {
       '1': 'gps_location_request',
-      '3': 78,
+      '3': 86,
       '4': 1,
       '5': 11,
       '6': '.PB_Gps.LocationRequest',
@@ -778,7 +850,7 @@ const Main$json = {
     },
     {
       '1': 'gps_location',
-      '3': 79,
+      '3': 87,
       '4': 1,
       '5': 11,
       '6': '.PB_Gps.Location',
@@ -905,13 +977,25 @@ final $typed_data.Uint8List mainDescriptor = $convert.base64Decode(
     '1kZXNrdG9wU3RhdHVzU3Vic2NyaWJlUmVxdWVzdBJzCiJkZXNrdG9wX3N0YXR1c191bnN1YnNj'
     'cmliZV9yZXF1ZXN0GEUgASgLMiQuUEJfRGVza3RvcC5TdGF0dXNVbnN1YnNjcmliZVJlcXVlc3'
     'RIAFIfZGVza3RvcFN0YXR1c1Vuc3Vic2NyaWJlUmVxdWVzdBI7Cg5kZXNrdG9wX3N0YXR1cxhG'
-    'IAEoCzISLlBCX0Rlc2t0b3AuU3RhdHVzSABSDWRlc2t0b3BTdGF0dXMSVQoYZ3BzX3N0cmVhbV'
-    '9zdGFydF9yZXF1ZXN0GEwgASgLMhouUEJfR3BzLlN0cmVhbVN0YXJ0UmVxdWVzdEgAUhVncHNT'
-    'dHJlYW1TdGFydFJlcXVlc3QSUgoXZ3BzX3N0cmVhbV9zdG9wX3JlcXVlc3QYTSABKAsyGS5QQl'
-    '9HcHMuU3RyZWFtU3RvcFJlcXVlc3RIAFIUZ3BzU3RyZWFtU3RvcFJlcXVlc3QSSwoUZ3BzX2xv'
-    'Y2F0aW9uX3JlcXVlc3QYTiABKAsyFy5QQl9HcHMuTG9jYXRpb25SZXF1ZXN0SABSEmdwc0xvY2'
-    'F0aW9uUmVxdWVzdBI1CgxncHNfbG9jYXRpb24YTyABKAsyEC5QQl9HcHMuTG9jYXRpb25IAFIL'
-    'Z3BzTG9jYXRpb25CCQoHY29udGVudA==');
+    'IAEoCzISLlBCX0Rlc2t0b3AuU3RhdHVzSABSDWRlc2t0b3BTdGF0dXMSVAoXbmV0d29ya19jb2'
+    '5uZWN0X3JlcXVlc3QYTCABKAsyGi5QQl9OZXR3b3JrLkNvbm5lY3RSZXF1ZXN0SABSFW5ldHdv'
+    'cmtDb25uZWN0UmVxdWVzdBJXChhuZXR3b3JrX2Nvbm5lY3RfcmVzcG9uc2UYTSABKAsyGy5QQl'
+    '9OZXR3b3JrLkNvbm5lY3RSZXNwb25zZUgAUhZuZXR3b3JrQ29ubmVjdFJlc3BvbnNlEksKFG5l'
+    'dHdvcmtfc2VuZF9yZXF1ZXN0GE4gASgLMhcuUEJfTmV0d29yay5TZW5kUmVxdWVzdEgAUhJuZX'
+    'R3b3JrU2VuZFJlcXVlc3QSTgoVbmV0d29ya19zZW5kX3Jlc3BvbnNlGE8gASgLMhguUEJfTmV0'
+    'd29yay5TZW5kUmVzcG9uc2VIAFITbmV0d29ya1NlbmRSZXNwb25zZRJLChRuZXR3b3JrX3JlY2'
+    'VpdmVfZGF0YRhQIAEoCzIXLlBCX05ldHdvcmsuUmVjZWl2ZURhdGFIAFISbmV0d29ya1JlY2Vp'
+    'dmVEYXRhEk4KFW5ldHdvcmtfY2xvc2VfcmVxdWVzdBhRIAEoCzIYLlBCX05ldHdvcmsuQ2xvc2'
+    'VSZXF1ZXN0SABSE25ldHdvcmtDbG9zZVJlcXVlc3QSUQoWbmV0d29ya19jbG9zZV9yZXNwb25z'
+    'ZRhSIAEoCzIZLlBCX05ldHdvcmsuQ2xvc2VSZXNwb25zZUgAUhRuZXR3b3JrQ2xvc2VSZXNwb2'
+    '5zZRJOChVuZXR3b3JrX3N0YXRlX2NoYW5nZWQYUyABKAsyGC5QQl9OZXR3b3JrLlN0YXRlQ2hh'
+    'bmdlZEgAUhNuZXR3b3JrU3RhdGVDaGFuZ2VkElUKGGdwc19zdHJlYW1fc3RhcnRfcmVxdWVzdB'
+    'hUIAEoCzIaLlBCX0dwcy5TdHJlYW1TdGFydFJlcXVlc3RIAFIVZ3BzU3RyZWFtU3RhcnRSZXF1'
+    'ZXN0ElIKF2dwc19zdHJlYW1fc3RvcF9yZXF1ZXN0GFUgASgLMhkuUEJfR3BzLlN0cmVhbVN0b3'
+    'BSZXF1ZXN0SABSFGdwc1N0cmVhbVN0b3BSZXF1ZXN0EksKFGdwc19sb2NhdGlvbl9yZXF1ZXN0'
+    'GFYgASgLMhcuUEJfR3BzLkxvY2F0aW9uUmVxdWVzdEgAUhJncHNMb2NhdGlvblJlcXVlc3QSNQ'
+    'oMZ3BzX2xvY2F0aW9uGFcgASgLMhAuUEJfR3BzLkxvY2F0aW9uSABSC2dwc0xvY2F0aW9uQgkK'
+    'B2NvbnRlbnQ=');
 
 @$core.Deprecated('Use regionDescriptor instead')
 const Region$json = {

@@ -43,4 +43,5 @@ part 'api/gui.dart';
 part 'api/gpio.dart';
 part 'api/property.dart';
 part 'api/desktop.dart';
+part 'api/network.dart';
 part 'api/gps.dart';

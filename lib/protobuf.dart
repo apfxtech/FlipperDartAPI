@@ -8,4 +8,5 @@ export 'generated/gui.pb.dart';
 export 'generated/gpio.pb.dart';
 export 'generated/property.pb.dart';
 export 'generated/desktop.pb.dart';
+export 'generated/network.pb.dart';
 export 'generated/gps.pb.dart';

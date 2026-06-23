@@ -18,8 +18,9 @@ import 'application.pb.dart' as $2;
 import 'desktop.pb.dart' as $6;
 import 'flipper.pbenum.dart';
 import 'gpio.pb.dart' as $4;
-import 'gps.pb.dart' as $7;
+import 'gps.pb.dart' as $8;
 import 'gui.pb.dart' as $3;
+import 'network.pb.dart' as $7;
 import 'property.pb.dart' as $5;
 import 'storage.pb.dart' as $1;
 import 'system.pb.dart' as $0;
@@ -179,6 +180,14 @@ enum Main_Content {
   gpioGetOtgModeResponse,
   gpioSetOtgMode,
   appButtonPressReleaseRequest,
+  networkConnectRequest,
+  networkConnectResponse,
+  networkSendRequest,
+  networkSendResponse,
+  networkReceiveData,
+  networkCloseRequest,
+  networkCloseResponse,
+  networkStateChanged,
   gpsStreamStartRequest,
   gpsStreamStopRequest,
   gpsLocationRequest,
@@ -263,10 +272,18 @@ class Main extends $pb.GeneratedMessage {
     $4.GetOtgModeResponse? gpioGetOtgModeResponse,
     $4.SetOtgMode? gpioSetOtgMode,
     $2.AppButtonPressReleaseRequest? appButtonPressReleaseRequest,
-    $7.StreamStartRequest? gpsStreamStartRequest,
-    $7.StreamStopRequest? gpsStreamStopRequest,
-    $7.LocationRequest? gpsLocationRequest,
-    $7.Location? gpsLocation,
+    $7.ConnectRequest? networkConnectRequest,
+    $7.ConnectResponse? networkConnectResponse,
+    $7.SendRequest? networkSendRequest,
+    $7.SendResponse? networkSendResponse,
+    $7.ReceiveData? networkReceiveData,
+    $7.CloseRequest? networkCloseRequest,
+    $7.CloseResponse? networkCloseResponse,
+    $7.StateChanged? networkStateChanged,
+    $8.StreamStartRequest? gpsStreamStartRequest,
+    $8.StreamStopRequest? gpsStreamStopRequest,
+    $8.LocationRequest? gpsLocationRequest,
+    $8.Location? gpsLocation,
   }) {
     final result = create();
     if (commandId != null) result.commandId = commandId;
@@ -402,6 +419,22 @@ class Main extends $pb.GeneratedMessage {
     if (gpioSetOtgMode != null) result.gpioSetOtgMode = gpioSetOtgMode;
     if (appButtonPressReleaseRequest != null)
       result.appButtonPressReleaseRequest = appButtonPressReleaseRequest;
+    if (networkConnectRequest != null)
+      result.networkConnectRequest = networkConnectRequest;
+    if (networkConnectResponse != null)
+      result.networkConnectResponse = networkConnectResponse;
+    if (networkSendRequest != null)
+      result.networkSendRequest = networkSendRequest;
+    if (networkSendResponse != null)
+      result.networkSendResponse = networkSendResponse;
+    if (networkReceiveData != null)
+      result.networkReceiveData = networkReceiveData;
+    if (networkCloseRequest != null)
+      result.networkCloseRequest = networkCloseRequest;
+    if (networkCloseResponse != null)
+      result.networkCloseResponse = networkCloseResponse;
+    if (networkStateChanged != null)
+      result.networkStateChanged = networkStateChanged;
     if (gpsStreamStartRequest != null)
       result.gpsStreamStartRequest = gpsStreamStartRequest;
     if (gpsStreamStopRequest != null)
@@ -494,10 +527,18 @@ class Main extends $pb.GeneratedMessage {
     73: Main_Content.gpioGetOtgModeResponse,
     74: Main_Content.gpioSetOtgMode,
     75: Main_Content.appButtonPressReleaseRequest,
-    76: Main_Content.gpsStreamStartRequest,
-    77: Main_Content.gpsStreamStopRequest,
-    78: Main_Content.gpsLocationRequest,
-    79: Main_Content.gpsLocation,
+    76: Main_Content.networkConnectRequest,
+    77: Main_Content.networkConnectResponse,
+    78: Main_Content.networkSendRequest,
+    79: Main_Content.networkSendResponse,
+    80: Main_Content.networkReceiveData,
+    81: Main_Content.networkCloseRequest,
+    82: Main_Content.networkCloseResponse,
+    83: Main_Content.networkStateChanged,
+    84: Main_Content.gpsStreamStartRequest,
+    85: Main_Content.gpsStreamStopRequest,
+    86: Main_Content.gpsLocationRequest,
+    87: Main_Content.gpsLocation,
     0: Main_Content.notSet
   };
   static final $pb.BuilderInfo _i = $pb.BuilderInfo(
@@ -580,7 +621,15 @@ class Main extends $pb.GeneratedMessage {
       76,
       77,
       78,
-      79
+      79,
+      80,
+      81,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87
     ])
     ..aI(1, _omitFieldNames ? '' : 'commandId', fieldType: $pb.PbFieldType.OU3)
     ..aE<CommandStatus>(2, _omitFieldNames ? '' : 'commandStatus',
@@ -762,16 +811,33 @@ class Main extends $pb.GeneratedMessage {
     ..aOM<$2.AppButtonPressReleaseRequest>(
         75, _omitFieldNames ? '' : 'appButtonPressReleaseRequest',
         subBuilder: $2.AppButtonPressReleaseRequest.create)
-    ..aOM<$7.StreamStartRequest>(
-        76, _omitFieldNames ? '' : 'gpsStreamStartRequest',
-        subBuilder: $7.StreamStartRequest.create)
-    ..aOM<$7.StreamStopRequest>(
-        77, _omitFieldNames ? '' : 'gpsStreamStopRequest',
-        subBuilder: $7.StreamStopRequest.create)
-    ..aOM<$7.LocationRequest>(78, _omitFieldNames ? '' : 'gpsLocationRequest',
-        subBuilder: $7.LocationRequest.create)
-    ..aOM<$7.Location>(79, _omitFieldNames ? '' : 'gpsLocation',
-        subBuilder: $7.Location.create)
+    ..aOM<$7.ConnectRequest>(76, _omitFieldNames ? '' : 'networkConnectRequest',
+        subBuilder: $7.ConnectRequest.create)
+    ..aOM<$7.ConnectResponse>(
+        77, _omitFieldNames ? '' : 'networkConnectResponse',
+        subBuilder: $7.ConnectResponse.create)
+    ..aOM<$7.SendRequest>(78, _omitFieldNames ? '' : 'networkSendRequest',
+        subBuilder: $7.SendRequest.create)
+    ..aOM<$7.SendResponse>(79, _omitFieldNames ? '' : 'networkSendResponse',
+        subBuilder: $7.SendResponse.create)
+    ..aOM<$7.ReceiveData>(80, _omitFieldNames ? '' : 'networkReceiveData',
+        subBuilder: $7.ReceiveData.create)
+    ..aOM<$7.CloseRequest>(81, _omitFieldNames ? '' : 'networkCloseRequest',
+        subBuilder: $7.CloseRequest.create)
+    ..aOM<$7.CloseResponse>(82, _omitFieldNames ? '' : 'networkCloseResponse',
+        subBuilder: $7.CloseResponse.create)
+    ..aOM<$7.StateChanged>(83, _omitFieldNames ? '' : 'networkStateChanged',
+        subBuilder: $7.StateChanged.create)
+    ..aOM<$8.StreamStartRequest>(
+        84, _omitFieldNames ? '' : 'gpsStreamStartRequest',
+        subBuilder: $8.StreamStartRequest.create)
+    ..aOM<$8.StreamStopRequest>(
+        85, _omitFieldNames ? '' : 'gpsStreamStopRequest',
+        subBuilder: $8.StreamStopRequest.create)
+    ..aOM<$8.LocationRequest>(86, _omitFieldNames ? '' : 'gpsLocationRequest',
+        subBuilder: $8.LocationRequest.create)
+    ..aOM<$8.Location>(87, _omitFieldNames ? '' : 'gpsLocation',
+        subBuilder: $8.Location.create)
     ..hasRequiredFields = false;
 
   @$core.Deprecated('See https://github.com/google/protobuf.dart/issues/998.')
@@ -868,6 +934,14 @@ class Main extends $pb.GeneratedMessage {
   @$pb.TagNumber(77)
   @$pb.TagNumber(78)
   @$pb.TagNumber(79)
+  @$pb.TagNumber(80)
+  @$pb.TagNumber(81)
+  @$pb.TagNumber(82)
+  @$pb.TagNumber(83)
+  @$pb.TagNumber(84)
+  @$pb.TagNumber(85)
+  @$pb.TagNumber(86)
+  @$pb.TagNumber(87)
   Main_Content whichContent() => _Main_ContentByTag[$_whichOneof(0)]!;
   @$pb.TagNumber(4)
   @$pb.TagNumber(5)
@@ -945,6 +1019,14 @@ class Main extends $pb.GeneratedMessage {
   @$pb.TagNumber(77)
   @$pb.TagNumber(78)
   @$pb.TagNumber(79)
+  @$pb.TagNumber(80)
+  @$pb.TagNumber(81)
+  @$pb.TagNumber(82)
+  @$pb.TagNumber(83)
+  @$pb.TagNumber(84)
+  @$pb.TagNumber(85)
+  @$pb.TagNumber(86)
+  @$pb.TagNumber(87)
   void clearContent() => $_clearField($_whichOneof(0));
 
   @$pb.TagNumber(1)
@@ -1808,49 +1890,137 @@ class Main extends $pb.GeneratedMessage {
       $_ensure(74);
 
   @$pb.TagNumber(76)
-  $7.StreamStartRequest get gpsStreamStartRequest => $_getN(75);
+  $7.ConnectRequest get networkConnectRequest => $_getN(75);
   @$pb.TagNumber(76)
-  set gpsStreamStartRequest($7.StreamStartRequest value) =>
-      $_setField(76, value);
+  set networkConnectRequest($7.ConnectRequest value) => $_setField(76, value);
   @$pb.TagNumber(76)
-  $core.bool hasGpsStreamStartRequest() => $_has(75);
+  $core.bool hasNetworkConnectRequest() => $_has(75);
   @$pb.TagNumber(76)
-  void clearGpsStreamStartRequest() => $_clearField(76);
+  void clearNetworkConnectRequest() => $_clearField(76);
   @$pb.TagNumber(76)
-  $7.StreamStartRequest ensureGpsStreamStartRequest() => $_ensure(75);
+  $7.ConnectRequest ensureNetworkConnectRequest() => $_ensure(75);
 
   @$pb.TagNumber(77)
-  $7.StreamStopRequest get gpsStreamStopRequest => $_getN(76);
+  $7.ConnectResponse get networkConnectResponse => $_getN(76);
   @$pb.TagNumber(77)
-  set gpsStreamStopRequest($7.StreamStopRequest value) => $_setField(77, value);
+  set networkConnectResponse($7.ConnectResponse value) => $_setField(77, value);
   @$pb.TagNumber(77)
-  $core.bool hasGpsStreamStopRequest() => $_has(76);
+  $core.bool hasNetworkConnectResponse() => $_has(76);
   @$pb.TagNumber(77)
-  void clearGpsStreamStopRequest() => $_clearField(77);
+  void clearNetworkConnectResponse() => $_clearField(77);
   @$pb.TagNumber(77)
-  $7.StreamStopRequest ensureGpsStreamStopRequest() => $_ensure(76);
+  $7.ConnectResponse ensureNetworkConnectResponse() => $_ensure(76);
 
   @$pb.TagNumber(78)
-  $7.LocationRequest get gpsLocationRequest => $_getN(77);
+  $7.SendRequest get networkSendRequest => $_getN(77);
   @$pb.TagNumber(78)
-  set gpsLocationRequest($7.LocationRequest value) => $_setField(78, value);
+  set networkSendRequest($7.SendRequest value) => $_setField(78, value);
   @$pb.TagNumber(78)
-  $core.bool hasGpsLocationRequest() => $_has(77);
+  $core.bool hasNetworkSendRequest() => $_has(77);
   @$pb.TagNumber(78)
-  void clearGpsLocationRequest() => $_clearField(78);
+  void clearNetworkSendRequest() => $_clearField(78);
   @$pb.TagNumber(78)
-  $7.LocationRequest ensureGpsLocationRequest() => $_ensure(77);
+  $7.SendRequest ensureNetworkSendRequest() => $_ensure(77);
 
   @$pb.TagNumber(79)
-  $7.Location get gpsLocation => $_getN(78);
+  $7.SendResponse get networkSendResponse => $_getN(78);
   @$pb.TagNumber(79)
-  set gpsLocation($7.Location value) => $_setField(79, value);
+  set networkSendResponse($7.SendResponse value) => $_setField(79, value);
   @$pb.TagNumber(79)
-  $core.bool hasGpsLocation() => $_has(78);
+  $core.bool hasNetworkSendResponse() => $_has(78);
   @$pb.TagNumber(79)
-  void clearGpsLocation() => $_clearField(79);
+  void clearNetworkSendResponse() => $_clearField(79);
   @$pb.TagNumber(79)
-  $7.Location ensureGpsLocation() => $_ensure(78);
+  $7.SendResponse ensureNetworkSendResponse() => $_ensure(78);
+
+  @$pb.TagNumber(80)
+  $7.ReceiveData get networkReceiveData => $_getN(79);
+  @$pb.TagNumber(80)
+  set networkReceiveData($7.ReceiveData value) => $_setField(80, value);
+  @$pb.TagNumber(80)
+  $core.bool hasNetworkReceiveData() => $_has(79);
+  @$pb.TagNumber(80)
+  void clearNetworkReceiveData() => $_clearField(80);
+  @$pb.TagNumber(80)
+  $7.ReceiveData ensureNetworkReceiveData() => $_ensure(79);
+
+  @$pb.TagNumber(81)
+  $7.CloseRequest get networkCloseRequest => $_getN(80);
+  @$pb.TagNumber(81)
+  set networkCloseRequest($7.CloseRequest value) => $_setField(81, value);
+  @$pb.TagNumber(81)
+  $core.bool hasNetworkCloseRequest() => $_has(80);
+  @$pb.TagNumber(81)
+  void clearNetworkCloseRequest() => $_clearField(81);
+  @$pb.TagNumber(81)
+  $7.CloseRequest ensureNetworkCloseRequest() => $_ensure(80);
+
+  @$pb.TagNumber(82)
+  $7.CloseResponse get networkCloseResponse => $_getN(81);
+  @$pb.TagNumber(82)
+  set networkCloseResponse($7.CloseResponse value) => $_setField(82, value);
+  @$pb.TagNumber(82)
+  $core.bool hasNetworkCloseResponse() => $_has(81);
+  @$pb.TagNumber(82)
+  void clearNetworkCloseResponse() => $_clearField(82);
+  @$pb.TagNumber(82)
+  $7.CloseResponse ensureNetworkCloseResponse() => $_ensure(81);
+
+  @$pb.TagNumber(83)
+  $7.StateChanged get networkStateChanged => $_getN(82);
+  @$pb.TagNumber(83)
+  set networkStateChanged($7.StateChanged value) => $_setField(83, value);
+  @$pb.TagNumber(83)
+  $core.bool hasNetworkStateChanged() => $_has(82);
+  @$pb.TagNumber(83)
+  void clearNetworkStateChanged() => $_clearField(83);
+  @$pb.TagNumber(83)
+  $7.StateChanged ensureNetworkStateChanged() => $_ensure(82);
+
+  @$pb.TagNumber(84)
+  $8.StreamStartRequest get gpsStreamStartRequest => $_getN(83);
+  @$pb.TagNumber(84)
+  set gpsStreamStartRequest($8.StreamStartRequest value) =>
+      $_setField(84, value);
+  @$pb.TagNumber(84)
+  $core.bool hasGpsStreamStartRequest() => $_has(83);
+  @$pb.TagNumber(84)
+  void clearGpsStreamStartRequest() => $_clearField(84);
+  @$pb.TagNumber(84)
+  $8.StreamStartRequest ensureGpsStreamStartRequest() => $_ensure(83);
+
+  @$pb.TagNumber(85)
+  $8.StreamStopRequest get gpsStreamStopRequest => $_getN(84);
+  @$pb.TagNumber(85)
+  set gpsStreamStopRequest($8.StreamStopRequest value) => $_setField(85, value);
+  @$pb.TagNumber(85)
+  $core.bool hasGpsStreamStopRequest() => $_has(84);
+  @$pb.TagNumber(85)
+  void clearGpsStreamStopRequest() => $_clearField(85);
+  @$pb.TagNumber(85)
+  $8.StreamStopRequest ensureGpsStreamStopRequest() => $_ensure(84);
+
+  @$pb.TagNumber(86)
+  $8.LocationRequest get gpsLocationRequest => $_getN(85);
+  @$pb.TagNumber(86)
+  set gpsLocationRequest($8.LocationRequest value) => $_setField(86, value);
+  @$pb.TagNumber(86)
+  $core.bool hasGpsLocationRequest() => $_has(85);
+  @$pb.TagNumber(86)
+  void clearGpsLocationRequest() => $_clearField(86);
+  @$pb.TagNumber(86)
+  $8.LocationRequest ensureGpsLocationRequest() => $_ensure(85);
+
+  @$pb.TagNumber(87)
+  $8.Location get gpsLocation => $_getN(86);
+  @$pb.TagNumber(87)
+  set gpsLocation($8.Location value) => $_setField(87, value);
+  @$pb.TagNumber(87)
+  $core.bool hasGpsLocation() => $_has(86);
+  @$pb.TagNumber(87)
+  void clearGpsLocation() => $_clearField(87);
+  @$pb.TagNumber(87)
+  $8.Location ensureGpsLocation() => $_ensure(86);
 }
 
 class Region_Band extends $pb.GeneratedMessage {

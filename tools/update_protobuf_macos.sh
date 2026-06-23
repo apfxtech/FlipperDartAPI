@@ -47,6 +47,7 @@ rm -f "$OUT_DIR"/*.pb*.dart
   "$PROTO_DIR/gpio.proto" \
   "$PROTO_DIR/property.proto" \
   "$PROTO_DIR/desktop.proto" \
+  "$PROTO_DIR/network.proto" \
   "$PROTO_DIR/gps.proto"
 
 cat > "$EXPORT_FILE" <<'EOF'
@@ -60,6 +61,7 @@ export 'generated/gui.pb.dart';
 export 'generated/gpio.pb.dart';
 export 'generated/property.pb.dart';
 export 'generated/desktop.pb.dart';
+export 'generated/network.pb.dart';
 export 'generated/gps.pb.dart';
 EOF
 
