@@ -11,6 +11,16 @@ class GpsFix {
     this.satellites = 0,
   });
 
+  factory GpsFix.fromLocation(Location location) => GpsFix(
+        latitude: location.latitude / 1e7,
+        longitude: location.longitude / 1e7,
+        heading: location.heading / 100,
+        speed: location.speed / 1000,
+        altitude: location.altitude / 100,
+        accuracy: location.accuracy / 1000,
+        satellites: location.satellites,
+      );
+
   final double latitude;
   final double longitude;
   final double heading;
@@ -18,6 +28,8 @@ class GpsFix {
   final double altitude;
   final double accuracy;
   final int satellites;
+
+  bool get hasFix => latitude != 0 || longitude != 0;
 }
 
 enum GpsReadiness {
@@ -171,5 +183,17 @@ extension FlipperGpsApi on FlipperClient {
     final responder = FlipperGpsResponder(this, provider);
     responder.attach();
     return responder;
+  }
+
+  Stream<GpsFix> flipperLocationStream() {
+    return notificationStream.transform(
+      StreamTransformer<Main, GpsFix>.fromHandlers(
+        handleData: (frame, sink) {
+          if (frame.hasGpsLocation()) {
+            sink.add(GpsFix.fromLocation(frame.gpsLocation));
+          }
+        },
+      ),
+    );
   }
 }
