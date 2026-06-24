@@ -1,13 +1,19 @@
 part of '../flipper_client.dart';
 
 class _NetworkConnection {
-  _NetworkConnection(this.id, this.protocol);
+  _NetworkConnection.tcp(this.id) : protocol = Protocol.TCP, isWebSocket = false;
+  _NetworkConnection.udp(this.id) : protocol = Protocol.UDP, isWebSocket = false;
+  _NetworkConnection.webSocket(this.id)
+    : protocol = Protocol.TCP,
+      isWebSocket = true;
 
   final int id;
   final Protocol protocol;
+  final bool isWebSocket;
 
   Socket? tcp;
   RawDatagramSocket? udp;
+  WebSocket? ws;
   InternetAddress? udpRemote;
   int udpPort = 0;
   StreamSubscription<dynamic>? subscription;
@@ -19,11 +25,13 @@ class FlipperNetworkResponder {
 
   static const int maxConnections = 8;
   static const int maxChunkSize = 512;
+  static const int _tlsPort = 443;
   static const Duration _defaultTimeout = Duration(seconds: 30);
 
   final FlipperClient _client;
   final Map<int, _NetworkConnection> _connections = {};
 
+  HttpClient? _httpClient;
   StreamSubscription<Main>? _notifications;
   StreamSubscription<FlipperConnectionState>? _connection;
 
@@ -40,6 +48,8 @@ class FlipperNetworkResponder {
     await notifications?.cancel();
     await connection?.cancel();
     await _closeAll();
+    _httpClient?.close(force: true);
+    _httpClient = null;
   }
 
   void _onConnection(FlipperConnectionState state) {
@@ -55,6 +65,10 @@ class FlipperNetworkResponder {
       unawaited(_onSend(frame.networkSendRequest));
     } else if (frame.hasNetworkCloseRequest()) {
       unawaited(_onClose(frame.networkCloseRequest));
+    } else if (frame.hasNetworkHttpRequest()) {
+      unawaited(_onHttp(frame.networkHttpRequest));
+    } else if (frame.hasNetworkWebsocketOpenRequest()) {
+      unawaited(_onWebSocketOpen(frame.networkWebsocketOpenRequest));
     }
   }
 
@@ -89,14 +103,20 @@ class FlipperNetworkResponder {
     ConnectRequest request,
     Duration timeout,
   ) async {
-    final connection = _NetworkConnection(id, Protocol.TCP);
+    final connection = _NetworkConnection.tcp(id);
     _connections[id] = connection;
     try {
-      final socket = await Socket.connect(
-        request.host,
-        request.port,
-        timeout: timeout,
-      );
+      final socket = _usesTls(request)
+          ? await SecureSocket.connect(
+              request.host,
+              request.port,
+              timeout: timeout,
+            )
+          : await Socket.connect(
+              request.host,
+              request.port,
+              timeout: timeout,
+            );
       if (connection.closed) {
         socket.destroy();
         return;
@@ -120,7 +140,7 @@ class FlipperNetworkResponder {
     ConnectRequest request,
     Duration timeout,
   ) async {
-    final connection = _NetworkConnection(id, Protocol.UDP);
+    final connection = _NetworkConnection.udp(id);
     _connections[id] = connection;
     try {
       final addresses = await InternetAddress.lookup(request.host)
@@ -156,6 +176,51 @@ class FlipperNetworkResponder {
     }
   }
 
+  Future<void> _onWebSocketOpen(WebSocketOpenRequest request) async {
+    final id = request.connectionId;
+    if (_connections.containsKey(id)) {
+      await _sendConnectError(id, ErrorCode.INVALID_CONNECTION);
+      return;
+    }
+    if (_connections.length >= maxConnections) {
+      await _sendConnectError(id, ErrorCode.MAX_CONNECTIONS);
+      return;
+    }
+    if (request.url.isEmpty) {
+      await _sendConnectError(id, ErrorCode.INVALID_URL);
+      return;
+    }
+
+    final timeout = request.timeoutMs > 0
+        ? Duration(milliseconds: request.timeoutMs)
+        : _defaultTimeout;
+
+    final connection = _NetworkConnection.webSocket(id);
+    _connections[id] = connection;
+    try {
+      final headers = parseHeaderBlock(request.headers);
+      final socket = await WebSocket.connect(
+        request.url,
+        headers: headers.isEmpty ? null : headers,
+      ).timeout(timeout);
+      if (connection.closed) {
+        await socket.close();
+        return;
+      }
+      connection.ws = socket;
+      connection.subscription = socket.listen(
+        (frame) => _onWebSocketFrame(id, frame),
+        onError: (Object error) => _onSocketError(id, error),
+        onDone: () => _onSocketDone(id),
+        cancelOnError: true,
+      );
+      await _sendConnectSuccess(id, request.url);
+    } catch (error) {
+      _connections.remove(id);
+      await _sendConnectError(id, _errorFor(error));
+    }
+  }
+
   Future<void> _onSend(SendRequest request) async {
     final id = request.connectionId;
     final connection = _connections[id];
@@ -165,7 +230,19 @@ class FlipperNetworkResponder {
     }
     final data = request.data;
     try {
-      if (connection.protocol == Protocol.UDP) {
+      if (connection.isWebSocket) {
+        final socket = connection.ws;
+        if (socket == null) {
+          await _sendSendResponse(id, 0, ErrorCode.NOT_CONNECTED);
+          return;
+        }
+        if (request.binary) {
+          socket.add(data);
+        } else {
+          socket.add(utf8.decode(data));
+        }
+        await _sendSendResponse(id, data.length, ErrorCode.NONE);
+      } else if (connection.protocol == Protocol.UDP) {
         final socket = connection.udp;
         if (socket == null) {
           await _sendSendResponse(id, 0, ErrorCode.NOT_CONNECTED);
@@ -204,11 +281,111 @@ class FlipperNetworkResponder {
     await _sendCloseResponse(id, ErrorCode.NONE);
   }
 
+  Future<void> _onHttp(HttpRequest request) async {
+    final id = request.requestId;
+    final timeout = request.timeoutMs > 0
+        ? Duration(milliseconds: request.timeoutMs)
+        : _defaultTimeout;
+
+    final Uri uri;
+    try {
+      uri = Uri.parse(request.url);
+      if (!uri.hasScheme || uri.host.isEmpty) {
+        await _sendHttpError(id, ErrorCode.INVALID_URL);
+        return;
+      }
+    } catch (_) {
+      await _sendHttpError(id, ErrorCode.INVALID_URL);
+      return;
+    }
+
+    final client = _httpClient ??= HttpClient()
+      ..connectionTimeout = timeout;
+
+    try {
+      List<int>? body;
+      if (request.sendPath.isNotEmpty) {
+        body = await _client.storageReadChunked(request.sendPath);
+      } else if (request.body.isNotEmpty) {
+        body = request.body;
+      }
+
+      final clientRequest = await client
+          .openUrl(_methodName(request.method), uri)
+          .timeout(timeout);
+
+      parseHeaderBlock(request.headers).forEach((name, value) {
+        clientRequest.headers.set(name, value);
+      });
+      if (body != null) {
+        clientRequest.add(body);
+      }
+
+      final response = await clientRequest.close().timeout(timeout);
+      final status = response.statusCode;
+      final headers = request.includeHeaders
+          ? _serializeHeaders(response.headers)
+          : '';
+
+      if (request.savePath.isNotEmpty) {
+        final bytes = BytesBuilder(copy: true);
+        await for (final chunk in response.timeout(timeout)) {
+          bytes.add(chunk);
+        }
+        final size = bytes.length;
+        await _client.storageWriteChunked(
+          request.savePath,
+          bytes.takeBytes(),
+          priority: FlipperRequestPriority.background,
+        );
+        await _sendHttpResponse(
+          id,
+          status: status,
+          bodySize: size,
+          savedToFile: true,
+          headers: headers,
+        );
+      } else {
+        var size = 0;
+        await for (final chunk in response.timeout(timeout)) {
+          size += chunk.length;
+          for (final piece in chunkBytes(chunk, maxChunkSize)) {
+            await _sendReceiveData(id, piece, false);
+          }
+        }
+        await _sendHttpResponse(
+          id,
+          status: status,
+          bodySize: size,
+          savedToFile: false,
+          headers: headers,
+        );
+      }
+    } on FlipperWriteCancelledException {
+      await _sendHttpError(id, ErrorCode.FILE_ERROR);
+    } catch (error) {
+      LogService.log('[Network] http failed on $id: $error');
+      await _sendHttpError(id, _errorFor(error));
+    }
+  }
+
   void _onReceived(int id, List<int> data) {
-    for (var offset = 0; offset < data.length; offset += maxChunkSize) {
-      final remaining = data.length - offset;
-      final end = offset + (remaining < maxChunkSize ? remaining : maxChunkSize);
-      unawaited(_sendReceiveData(id, data.sublist(offset, end)));
+    for (final piece in chunkBytes(data, maxChunkSize)) {
+      unawaited(_sendReceiveData(id, piece, false));
+    }
+  }
+
+  void _onWebSocketFrame(int id, dynamic frame) {
+    if (frame is String) {
+      _onReceivedBinary(id, utf8.encode(frame), false);
+    } else if (frame is List<int>) {
+      _onReceivedBinary(id, frame, true);
+    }
+  }
+
+  void _onReceivedBinary(int id, List<int> data, bool binary) {
+    for (final piece in chunkBytes(data, maxChunkSize)) {
+      unawaited(_sendReceiveData(id, piece, binary));
     }
   }
 
@@ -245,6 +422,7 @@ class FlipperNetworkResponder {
     try {
       connection.tcp?.destroy();
       connection.udp?.close();
+      await connection.ws?.close();
     } catch (error) {
       LogService.log('[Network] teardown error on ${connection.id}: $error');
     }
@@ -258,8 +436,39 @@ class FlipperNetworkResponder {
     }
   }
 
+  static bool _usesTls(ConnectRequest request) => request.port == _tlsPort;
+
+  static String _methodName(HttpMethod method) {
+    switch (method) {
+      case HttpMethod.HTTP_POST:
+        return 'POST';
+      case HttpMethod.HTTP_PUT:
+        return 'PUT';
+      case HttpMethod.HTTP_PATCH:
+        return 'PATCH';
+      case HttpMethod.HTTP_DELETE:
+        return 'DELETE';
+      case HttpMethod.HTTP_HEAD:
+        return 'HEAD';
+      case HttpMethod.HTTP_GET:
+      default:
+        return 'GET';
+    }
+  }
+
+  static String _serializeHeaders(HttpHeaders headers) {
+    final map = <String, String>{};
+    headers.forEach((name, values) {
+      map[name] = values.join(', ');
+    });
+    return formatHeaderBlock(map);
+  }
+
   static ErrorCode _errorFor(Object error) {
     if (error is TimeoutException) return ErrorCode.TIMEOUT;
+    if (error is HandshakeException) return ErrorCode.TLS_FAILED;
+    if (error is TlsException) return ErrorCode.TLS_FAILED;
+    if (error is WebSocketException) return ErrorCode.INTERNAL_ERROR;
     if (error is SocketException) {
       final osError = error.osError;
       if (osError == null) {
@@ -327,12 +536,45 @@ class FlipperNetworkResponder {
     );
   }
 
-  Future<void> _sendReceiveData(int id, List<int> data) {
+  Future<void> _sendReceiveData(int id, List<int> data, bool binary) {
     return _send(
       Main(
-        networkReceiveData: ReceiveData(connectionId: id, data: data),
+        networkReceiveData: ReceiveData(
+          connectionId: id,
+          data: data,
+          binary: binary,
+        ),
       ),
       priority: FlipperRequestPriority.background,
+    );
+  }
+
+  Future<void> _sendHttpResponse(
+    int id, {
+    required int status,
+    required int bodySize,
+    required bool savedToFile,
+    required String headers,
+  }) {
+    return _send(
+      Main(
+        networkHttpResponse: HttpResponse(
+          requestId: id,
+          status: status,
+          error: ErrorCode.NONE,
+          bodySize: bodySize,
+          savedToFile: savedToFile,
+          headers: headers,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _sendHttpError(int id, ErrorCode error) {
+    return _send(
+      Main(
+        networkHttpResponse: HttpResponse(requestId: id, error: error),
+      ),
     );
   }
 

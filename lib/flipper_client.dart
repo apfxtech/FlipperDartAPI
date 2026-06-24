@@ -9,6 +9,7 @@ import 'package:protobuf/protobuf.dart' as $pb;
 import 'package:universal_ble/universal_ble.dart' as uble;
 import 'package:usb_serial/usb_serial.dart';
 
+import 'api/http_util.dart';
 import 'desktop_usb_isolate.dart';
 import 'device/discovered.dart';
 import 'log_service.dart';
