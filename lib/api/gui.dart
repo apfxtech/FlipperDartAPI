@@ -91,4 +91,14 @@ extension FlipperGuiApi on FlipperClient {
       priority: priority,
     );
   }
+
+  Future<void> guiSendInputAndForget(
+    SendInputEventRequest request, {
+    FlipperRequestPriority priority = FlipperRequestPriority.rightNow,
+  }) {
+    return sendRpc(
+      Main(guiSendInputEventRequest: request),
+      priority: priority,
+    );
+  }
 }
