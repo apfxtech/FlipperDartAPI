@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 Map<String, String> parseHeaderBlock(String raw) {
   final headers = <String, String>{};
   if (raw.isEmpty) return headers;
@@ -25,14 +27,21 @@ String formatHeaderBlock(Map<String, String> headers) {
   return buffer.toString();
 }
 
-Iterable<List<T>> chunkBytes<T>(List<T> data, int chunkSize) sync* {
-  if (chunkSize <= 0) {
+Uint8List asBytes(List<int> data) =>
+    data is Uint8List ? data : Uint8List.fromList(data);
+
+Iterable<Uint8List> chunkByteViews(Uint8List data, int chunkSize) sync* {
+  if (data.isEmpty) return;
+  if (chunkSize <= 0 || data.length <= chunkSize) {
     yield data;
     return;
   }
   for (var offset = 0; offset < data.length; offset += chunkSize) {
-    final remaining = data.length - offset;
-    final end = offset + (remaining < chunkSize ? remaining : chunkSize);
-    yield data.sublist(offset, end);
+    final end = offset + chunkSize;
+    yield Uint8List.sublistView(
+      data,
+      offset,
+      end < data.length ? end : data.length,
+    );
   }
 }

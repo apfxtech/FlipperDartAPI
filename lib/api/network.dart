@@ -72,16 +72,21 @@ class FlipperNetworkResponder {
     }
   }
 
-  Future<void> _onConnect(ConnectRequest request) async {
-    final id = request.connectionId;
+  Future<bool> _reserveSlot(int id) async {
     if (_connections.containsKey(id)) {
       await _sendConnectError(id, ErrorCode.INVALID_CONNECTION);
-      return;
+      return false;
     }
     if (_connections.length >= maxConnections) {
       await _sendConnectError(id, ErrorCode.MAX_CONNECTIONS);
-      return;
+      return false;
     }
+    return true;
+  }
+
+  Future<void> _onConnect(ConnectRequest request) async {
+    final id = request.connectionId;
+    if (!await _reserveSlot(id)) return;
     if (request.host.isEmpty || request.port == 0 || request.port > 65535) {
       await _sendConnectError(id, ErrorCode.INTERNAL_ERROR);
       return;
@@ -180,14 +185,7 @@ class FlipperNetworkResponder {
 
   Future<void> _onWebSocketOpen(WebSocketOpenRequest request) async {
     final id = request.connectionId;
-    if (_connections.containsKey(id)) {
-      await _sendConnectError(id, ErrorCode.INVALID_CONNECTION);
-      return;
-    }
-    if (_connections.length >= maxConnections) {
-      await _sendConnectError(id, ErrorCode.MAX_CONNECTIONS);
-      return;
-    }
+    if (!await _reserveSlot(id)) return;
     if (request.url.isEmpty) {
       await _sendConnectError(id, ErrorCode.INVALID_URL);
       return;
@@ -338,7 +336,7 @@ class FlipperNetworkResponder {
           : '';
 
       if (request.savePath.isNotEmpty) {
-        final bytes = BytesBuilder(copy: true);
+        final bytes = BytesBuilder(copy: false);
         await for (final chunk in response.timeout(timeout)) {
           bytes.add(chunk);
         }
@@ -360,7 +358,7 @@ class FlipperNetworkResponder {
         var size = 0;
         await for (final chunk in response.timeout(timeout)) {
           size += chunk.length;
-          for (final piece in chunkBytes(chunk, maxChunkSize)) {
+          for (final piece in chunkByteViews(asBytes(chunk), maxChunkSize)) {
             await _sendReceiveData(id, piece, false);
           }
         }
@@ -380,22 +378,18 @@ class FlipperNetworkResponder {
     }
   }
 
-  void _onReceived(int id, List<int> data) {
-    for (final piece in chunkBytes(data, maxChunkSize)) {
-      unawaited(_sendReceiveData(id, piece, false));
-    }
-  }
+  void _onReceived(int id, List<int> data) => _emitInbound(id, data, false);
 
   void _onWebSocketFrame(int id, dynamic frame) {
     if (frame is String) {
-      _onReceivedBinary(id, utf8.encode(frame), false);
+      _emitInbound(id, utf8.encode(frame), false);
     } else if (frame is List<int>) {
-      _onReceivedBinary(id, frame, true);
+      _emitInbound(id, frame, true);
     }
   }
 
-  void _onReceivedBinary(int id, List<int> data, bool binary) {
-    for (final piece in chunkBytes(data, maxChunkSize)) {
+  void _emitInbound(int id, List<int> data, bool binary) {
+    for (final piece in chunkByteViews(asBytes(data), maxChunkSize)) {
       unawaited(_sendReceiveData(id, piece, binary));
     }
   }
@@ -559,7 +553,7 @@ class FlipperNetworkResponder {
     );
   }
 
-  Future<void> _sendReceiveData(int id, List<int> data, bool binary) {
+  Future<void> _sendReceiveData(int id, Uint8List data, bool binary) {
     NetworkTrafficMonitor.instance.recordRx(data.length);
     return _send(
       Main(
