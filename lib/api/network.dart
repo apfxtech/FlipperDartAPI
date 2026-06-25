@@ -128,6 +128,7 @@ class FlipperNetworkResponder {
         onDone: () => _onSocketDone(id),
         cancelOnError: true,
       );
+      NetworkTrafficMonitor.instance.connectionOpened(request.host);
       await _sendConnectSuccess(id, socket.remoteAddress.address);
     } catch (error) {
       _connections.remove(id);
@@ -169,6 +170,7 @@ class FlipperNetworkResponder {
         onError: (Object error) => _onSocketError(id, error),
         onDone: () => _onSocketDone(id),
       );
+      NetworkTrafficMonitor.instance.connectionOpened(request.host);
       await _sendConnectSuccess(id, remote.address);
     } catch (error) {
       _connections.remove(id);
@@ -214,6 +216,7 @@ class FlipperNetworkResponder {
         onDone: () => _onSocketDone(id),
         cancelOnError: true,
       );
+      NetworkTrafficMonitor.instance.connectionOpened(_hostOf(request.url));
       await _sendConnectSuccess(id, request.url);
     } catch (error) {
       _connections.remove(id);
@@ -241,6 +244,7 @@ class FlipperNetworkResponder {
         } else {
           socket.add(utf8.decode(data));
         }
+        NetworkTrafficMonitor.instance.recordTx(data.length);
         await _sendSendResponse(id, data.length, ErrorCode.NONE);
       } else if (connection.protocol == Protocol.UDP) {
         final socket = connection.udp;
@@ -253,6 +257,7 @@ class FlipperNetworkResponder {
           connection.udpRemote!,
           connection.udpPort,
         );
+        NetworkTrafficMonitor.instance.recordTx(sent);
         await _sendSendResponse(id, sent, ErrorCode.NONE);
       } else {
         final socket = connection.tcp;
@@ -262,6 +267,7 @@ class FlipperNetworkResponder {
         }
         socket.add(data);
         await socket.flush();
+        NetworkTrafficMonitor.instance.recordTx(data.length);
         await _sendSendResponse(id, data.length, ErrorCode.NONE);
       }
     } catch (error) {
@@ -278,6 +284,7 @@ class FlipperNetworkResponder {
       return;
     }
     await _teardown(connection);
+    NetworkTrafficMonitor.instance.connectionClosed();
     await _sendCloseResponse(id, ErrorCode.NONE);
   }
 
@@ -299,6 +306,8 @@ class FlipperNetworkResponder {
       return;
     }
 
+    NetworkTrafficMonitor.instance.hostUpdated(uri.host);
+
     final client = _httpClient ??= HttpClient()
       ..connectionTimeout = timeout;
 
@@ -319,6 +328,7 @@ class FlipperNetworkResponder {
       });
       if (body != null) {
         clientRequest.add(body);
+        NetworkTrafficMonitor.instance.recordTx(body.length, host: uri.host);
       }
 
       final response = await clientRequest.close().timeout(timeout);
@@ -333,6 +343,7 @@ class FlipperNetworkResponder {
           bytes.add(chunk);
         }
         final size = bytes.length;
+        NetworkTrafficMonitor.instance.recordRx(size);
         await _client.storageWriteChunked(
           request.savePath,
           bytes.takeBytes(),
@@ -402,6 +413,7 @@ class FlipperNetworkResponder {
     final connection = _connections.remove(id);
     if (connection != null) {
       unawaited(_teardown(connection));
+      NetworkTrafficMonitor.instance.connectionClosed();
     }
     unawaited(_sendStateChanged(id, ConnectionState.ERROR, _errorFor(error)));
   }
@@ -410,6 +422,7 @@ class FlipperNetworkResponder {
     final connection = _connections.remove(id);
     if (connection == null) return;
     unawaited(_teardown(connection));
+    NetworkTrafficMonitor.instance.connectionClosed();
     unawaited(
       _sendStateChanged(id, ConnectionState.DISCONNECTED, ErrorCode.NONE),
     );
@@ -434,9 +447,19 @@ class FlipperNetworkResponder {
     for (final connection in connections) {
       await _teardown(connection);
     }
+    NetworkTrafficMonitor.instance.reset();
   }
 
   static bool _usesTls(ConnectRequest request) => request.port == _tlsPort;
+
+  static String _hostOf(String url) {
+    try {
+      final host = Uri.parse(url).host;
+      return host.isNotEmpty ? host : url;
+    } catch (_) {
+      return url;
+    }
+  }
 
   static String _methodName(HttpMethod method) {
     switch (method) {
@@ -537,6 +560,7 @@ class FlipperNetworkResponder {
   }
 
   Future<void> _sendReceiveData(int id, List<int> data, bool binary) {
+    NetworkTrafficMonitor.instance.recordRx(data.length);
     return _send(
       Main(
         networkReceiveData: ReceiveData(

@@ -162,8 +162,7 @@ class FlipperGpsResponder {
         priority: FlipperRequestPriority.background,
       );
     } catch (error) {
-      LogService.log('[GPS] failed to send location, stopping stream: $error');
-      await _stopStream();
+      LogService.log('[GPS] failed to send location: $error');
     }
   }
 
