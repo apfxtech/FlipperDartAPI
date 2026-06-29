@@ -23,6 +23,12 @@ extension FlipperWatchApi on FlipperClient {
     _collectionGen++;
   }
 
+  void freezeWatch() => _watchFreezeCount++;
+
+  void unfreezeWatch() {
+    if (_watchFreezeCount > 0) _watchFreezeCount--;
+  }
+
   Future<void> _runCollection(int gen) async {
     if (!isConnected) return;
 
@@ -166,7 +172,10 @@ extension FlipperWatchApi on FlipperClient {
       refreshTimer?.cancel();
       refreshTimer = Timer(delay, () {
         if (!alive()) return;
-        if (storageBusy || _mode != FlipperMode.rpc || cliExclusive) {
+        if (_watchFreezeCount > 0 ||
+            storageBusy ||
+            _mode != FlipperMode.rpc ||
+            cliExclusive) {
           // The link is occupied; check again after another quiet window.
           scheduleStorageRefresh();
           return;
@@ -182,11 +191,13 @@ extension FlipperWatchApi on FlipperClient {
 
     var tick = 0;
     const interval = Duration(seconds: 5);
+    const fullEvery = 12;
 
     try {
       while (alive()) {
         await Future<void>.delayed(interval);
         if (!alive()) break;
+        if (_watchFreezeCount > 0) continue;
         // A CLI session owns the transport: polling would only throw
         // "RPC switch blocked" every tick and spam the log. Skip quietly and
         // resume once the client is back in RPC mode.
@@ -196,25 +207,33 @@ extension FlipperWatchApi on FlipperClient {
         if (storageBusy) continue;
         tick++;
 
-        // Battery: partial every 5 s, full every 15 s
-        try {
-          final batch = await powerInfo(
-            priority: FlipperRequestPriority.background,
-          );
-          final all = {
-            for (final item in batch.items) 'power.${item.key}': item.value,
-          };
-          if (tick % 3 == 0) {
-            emit(all);
-          } else {
-            final partial = Map.fromEntries(
-              all.entries.where((e) => e.key.contains('current')),
+        if (tick % fullEvery == 0) {
+          try {
+            final batch = await powerInfo(
+              priority: FlipperRequestPriority.background,
             );
-            if (partial.isNotEmpty) emit(partial);
+            emit({
+              for (final item in batch.items) 'power.${item.key}': item.value,
+            });
+          } catch (e) {
+            LogService.log('[watchInfo] battery full: $e');
+            if (!alive()) break;
           }
-        } catch (e) {
-          LogService.log('[watchInfo] battery poll: $e');
-          if (!alive()) break;
+        } else {
+          try {
+            final batch = await propertyGet(
+              GetRequest(key: 'pwrinfo.battery.current'),
+              priority: FlipperRequestPriority.background,
+            );
+            final partial = {
+              for (final item in batch.items)
+                'power.${item.key.replaceAll('.', '_')}': item.value,
+            };
+            if (partial.isNotEmpty) emit(partial);
+          } catch (e) {
+            LogService.log('[watchInfo] battery current: $e');
+            if (!alive()) break;
+          }
         }
       }
     } finally {

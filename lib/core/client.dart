@@ -68,6 +68,7 @@ class FlipperClient {
   bool cliExclusive = false;
   bool _deviceInfoFetched = false;
   int _collectionGen = 0;
+  int _watchFreezeCount = 0;
   int _rxParseErrorStreak = 0;
 
   // Automatic single-shot reconnect after an unexpected link drop. One
