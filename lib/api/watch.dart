@@ -34,7 +34,7 @@ extension FlipperWatchApi on FlipperClient {
 
     void emit(Map<String, String> data) {
       if (gen != _collectionGen || _deviceInfoWatchCtrl.isClosed) return;
-      _deviceInfoWatchCtrl.add(data);
+      _publishDeviceInfoPatch(data);
     }
 
     bool alive() => gen == _collectionGen && isConnected;

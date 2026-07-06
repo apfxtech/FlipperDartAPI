@@ -6,22 +6,9 @@ class FlipperClient {
   static const String bleTxUuid = '19ed82ae-ed21-4c9d-4145-228e62fe0000';
   static const String cliPrompt = '\r\n\r\n>: ';
   static const String startRpcSession = 'start_rpc_session\r';
-
-  // Consecutive RX parse failures tolerated before the session is declared
-  // desynchronized and closed.
   static const int _maxRxParseErrorStreak = 3;
-
-  // Auto-reconnect oscillation guard: a restored session that lives at least
-  // this long is considered healthy and resets the quick-drop streak; after
-  // _maxQuickDropStreak consecutive short-lived sessions auto-reconnect stops
-  // until the next manual connect.
   static const Duration _quickDropWindow = Duration(seconds: 30);
   static const int _maxQuickDropStreak = 2;
-
-  // Pause between a dropped link and the in-place reconnect attempt. Gives the
-  // platform BLE stack time to finish tearing down the old connection — an
-  // instant re-connect races CoreBluetooth's cleanup and wedges the new
-  // attempt (lost write callbacks, then a full connect timeout).
   static const Duration _reconnectSettle = Duration(milliseconds: 600);
 
   final _devicesCtrl = StreamController<List<FlipperDevice>>.broadcast();
@@ -41,26 +28,14 @@ class FlipperClient {
   final Map<int, _PendingRpc> _pendingRpc = {};
   final List<_QueuedRequest> _requestQueue = [];
   final Map<String, String> _deviceInfoCache = {};
+  final Map<String, String> _deviceInfoWatchSnapshot = {};
   final _frameBuffer = _FrameBuffer();
   final _utf8Decoder = const Utf8Decoder(allowMalformed: true);
-
-  // All lifecycle transitions (connect, disconnect, CLI re-connect, fault
-  // teardown) run strictly one after another through this chain, so two
-  // transports can never be opened concurrently and a teardown can never
-  // interleave with a connect.
   Future<void> _lifecycleChain = Future.value();
-
-  // _sessionGen increments on every connect / teardown. Long-lived async tasks
-  // capture the generation they were started for and bail out when it no
-  // longer matches, so a stale task can never touch a newer session's state.
   int _sessionGen = 0;
   _Transport? _transport;
   StreamSubscription<List<int>>? _transportSub;
   FlipperDevice? _connectedDevice;
-  // The target of an in-flight connect attempt (the `connecting` phase). Set
-  // before the platform connect starts and cleared the moment the attempt
-  // commits, fails, or is aborted, so `connectingDevice` reflects only a live
-  // attempt — never a stale one.
   FlipperDevice? _connectingDevice;
   FlipperMode _mode = FlipperMode.disconnected;
   Future<void>? _switchToRpcFuture;
@@ -71,11 +46,6 @@ class FlipperClient {
   int _watchFreezeCount = 0;
   int _rxParseErrorStreak = 0;
 
-  // Automatic single-shot reconnect after an unexpected link drop. One
-  // attempt per fault, serialized with every other lifecycle operation, with
-  // an oscillation guard — it can never turn into a retry loop.
-  // (Stopwatch, not DateTime: the protobuf bindings shadow dart:core DateTime
-  // inside this library.)
   bool autoReconnect = true;
   final Stopwatch _sessionUptime = Stopwatch();
   int _quickDropStreak = 0;
@@ -84,48 +54,18 @@ class FlipperClient {
   int? _workerGen;
   int _requestSeq = 0;
   _QueuedRequest? _activeRequest;
-  // While a multi-frame request group is being transmitted, only frames of
-  // that commandId may leave the queue; everything else waits.
   int? _txGroupCommandId;
 
   int _nextCommandId = 1;
   bool _scanning = false;
-  // Coarse connection lifecycle and the single home for the `connecting`
-  // phase that neither `_transport` (still null until the session is committed)
-  // nor `_mode` (reads `disconnected` throughout connect) can express.
-  // `connected` is kept in lockstep with `_transport != null`, so `isConnected`
-  // derives from it. Used to refuse scans for the whole connect window:
-  // scanning competes with the connecting radio — on macOS the scan runs on a
-  // *second* CBCentralManager (universal_ble) while the link runs on the native
-  // plugin, and the contention provokes the very "connection timed out
-  // unexpectedly" drops seen during setup.
   _LinkPhase _linkPhase = _LinkPhase.disconnected;
   Completer<void>? _scanPhaseInterrupt;
-  // A room can hold several Flippers. Finding the first one does not end the
-  // scan immediately: it starts this grace window, during which the scan keeps
-  // running so additional units can still surface, before the phase is cut
-  // short. Still capped by the caller's overall scan timeout.
   static const Duration _scanGraceWindow = Duration(seconds: 5);
   Timer? _scanGraceTimer;
-
-  // Devices-stream throttle: scan results arrive per advertising packet
-  // (tens per second); listeners get at most one event per window plus a
-  // trailing one for the final state.
   static const Duration _devicesEmitWindow = Duration(milliseconds: 200);
   Timer? _devicesEmitTimer;
   bool _devicesEmitDirty = false;
-
-  // CLI commands are request/response over a shared text stream; two
-  // interleaved executeCli calls would corrupt each other's output.
   Future<void> _cliChain = Future.value();
-
-  // Storage activity tracking, maintained centrally in callRpcFrames /
-  // callRpcFramesMulti so every storage RPC is covered regardless of which
-  // API wrapper issued it. Only the heavy commands count — reads, writes and
-  // deletes, the ones that move real data over the link; list / stat / info
-  // are cheap display queries and neither hold `storageBusy` nor emit events.
-  // `storageMutations` fires only for commands that change SD-card contents
-  // (write, delete).
   int _storageOpsInFlight = 0;
   final _storageMutationCtrl = StreamController<void>.broadcast();
 
@@ -157,21 +97,8 @@ class FlipperClient {
   Stream<Main> get notificationStream => _broadcastCtrl.stream;
 
   Stream<FlipperRpcException> get errorStream => _errorCtrl.stream;
-
-  /// True while a heavy storage RPC (read, write or delete — the ones that
-  /// move real data) is in flight. Pollers should stay quiet: a long transfer
-  /// owns the link, and anything queued behind it only times out. Cheap
-  /// display queries (list, stat, info) do not hold this flag.
   bool get storageBusy => _storageOpsInFlight > 0;
-
-  /// Emits once per completed storage command that changes SD-card contents
-  /// (write, delete). Fires on completion regardless of outcome — a failed or
-  /// cancelled operation may still have changed the filesystem. Consumers
-  /// debounce and refresh storage info reactively.
   Stream<void> get storageMutations => _storageMutationCtrl.stream;
-
-  // USB hotplug events: native attach/detach broadcasts on Android, port-set
-  // diffs on desktop. Listeners call refreshUsbOnly in response.
   Stream<void> get usbEvents => _usbPlatform.usbEvents;
 
   List<FlipperDevice> get devices =>
@@ -180,19 +107,20 @@ class FlipperClient {
   List<FlipperDevice> listDevices() => devices;
 
   FlipperDevice? get connectedDevice => _connectedDevice;
-
-  /// True while a connection attempt is in flight (no session committed yet).
   bool get isConnecting => _linkPhase == _LinkPhase.connecting;
-
-  /// The target of the in-flight connect attempt, or null when not connecting.
   FlipperDevice? get connectingDevice => _connectingDevice;
-
-  /// The device the client is connected to, or — when an attempt is still in
-  /// flight — the one it is connecting to. Lets a UI surface and tear down a
-  /// stuck connect without waiting for it to commit or time out.
   FlipperDevice? get activeDevice => _connectedDevice ?? _connectingDevice;
 
   Map<String, String> get deviceInfoCache => Map.unmodifiable(_deviceInfoCache);
+
+  Map<String, String> get deviceInfoWatchSnapshot =>
+      Map.unmodifiable(_deviceInfoWatchSnapshot);
+
+  void _publishDeviceInfoPatch(Map<String, String> patch) {
+    if (patch.isEmpty) return;
+    _deviceInfoWatchSnapshot.addAll(patch);
+    if (!_deviceInfoWatchCtrl.isClosed) _deviceInfoWatchCtrl.add(patch);
+  }
 
   Stream<Map<String, String>> get deviceInfoStream =>
       _deviceInfoCompleteCtrl.stream;
@@ -270,9 +198,6 @@ class FlipperClient {
     Duration bleTimeout = const Duration(seconds: 10),
   }) async {
     _devices.clear();
-    // The connected device stays listed even though it no longer advertises /
-    // enumerates while a session holds it; dropping it would also break
-    // connectById for the active id.
     final connected = _connectedDevice;
     if (connected != null) _rememberDevice(connected);
     await _loadUsbDevices();
@@ -289,15 +214,9 @@ class FlipperClient {
 
   Future<void> scanBle({Duration timeout = const Duration(seconds: 10)}) async {
     if (_scanning) return;
-    // The flag goes up before the first await: two concurrent calls would
-    // otherwise both pass the guard and fight over the global scan callback.
     _scanning = true;
 
     try {
-      // Scanning competes with the radio (on macOS a second CBCentralManager
-      // halves effective throughput and provokes drops). It is refused for the
-      // whole connect window, and while a BLE link is live; a USB session
-      // leaves the BLE radio free, so scanning stays allowed there.
       if (_scanBlocked) {
         LogService.log(
           '[BLE] scan skipped: a connection is active or in progress',
@@ -359,10 +278,6 @@ class FlipperClient {
     _emitDevices(immediate: true);
   }
 
-  // Starts the post-discovery grace window the first time a Flipper appears in
-  // the current scan phase; later results don't reset it, so the window is "5s
-  // after the first unit", not "after the last". A no-op once running, after
-  // the phase ended, or with no active phase.
   void _armScanGrace() {
     if (_scanGraceTimer != null || _scanPhaseInterrupt == null) return;
     LogService.log(
@@ -692,7 +607,8 @@ class FlipperClient {
         _mode == FlipperMode.disconnected &&
         _requestQueue.isEmpty &&
         _pendingRpc.isEmpty &&
-        _deviceInfoCache.isEmpty) {
+        _deviceInfoCache.isEmpty &&
+        _deviceInfoWatchSnapshot.isEmpty) {
       return;
     }
     _sessionUptime
@@ -709,6 +625,7 @@ class FlipperClient {
     _switchToRpcFuture = null;
     _deviceInfoFetch = null;
     _deviceInfoCache.clear();
+    _deviceInfoWatchSnapshot.clear();
     _deviceInfoFetched = false;
     _frameBuffer.clear();
     _rxParseErrorStreak = 0;
@@ -1481,9 +1398,7 @@ class FlipperClient {
       final value = info.value.trim();
       if (key.isNotEmpty && value.isNotEmpty) {
         _deviceInfoCache[key] = value;
-        if (!_deviceInfoWatchCtrl.isClosed) {
-          _deviceInfoWatchCtrl.add({key: value});
-        }
+        _publishDeviceInfoPatch({key: value});
       }
     }
 
@@ -1800,9 +1715,7 @@ class FlipperClient {
     }
     _deviceInfoFetched = true;
     final snapshot = deviceInfoCache;
-    if (!_deviceInfoWatchCtrl.isClosed) {
-      _deviceInfoWatchCtrl.add(snapshot);
-    }
+    _publishDeviceInfoPatch(snapshot);
     if (!_deviceInfoCompleteCtrl.isClosed) {
       _deviceInfoCompleteCtrl.add(snapshot);
     }
