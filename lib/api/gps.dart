@@ -41,12 +41,85 @@ enum GpsReadiness {
 }
 
 abstract class GpsLocationProvider {
-
   Future<GpsReadiness> ensureReady();
 
   Stream<GpsFix> watch(int frequencyHz);
 
   Future<GpsFix?> current();
+}
+
+class _GpsStreamPump {
+  _GpsStreamPump({
+    required GpsLocationProvider provider,
+    required int hz,
+    required void Function(GpsFix) onFix,
+  })  : _provider = provider,
+        _hz = hz,
+        _onFix = onFix;
+
+  static const Duration _heartbeat = Duration(seconds: 2);
+
+  final GpsLocationProvider _provider;
+  final int _hz;
+  final void Function(GpsFix) _onFix;
+
+  StreamSubscription<GpsFix>? _sub;
+  Timer? _flushTimer;
+  Timer? _heartbeatTimer;
+  GpsFix? _pending;
+  GpsFix? _lastSent;
+  final Stopwatch _sinceEmit = Stopwatch();
+
+  void start() {
+    _sub = _provider.watch(_hz).listen(
+          _onPosition,
+          onError: (Object error) =>
+              LogService.log('[GPS] location stream error: $error'),
+        );
+    _heartbeatTimer = Timer.periodic(_heartbeat, (_) {
+      final fix = _lastSent;
+      if (fix != null && _sinceEmit.elapsed >= _heartbeat) _emit(fix);
+    });
+  }
+
+  Duration get _interval => Duration(milliseconds: (1000 / _hz).round());
+
+  void _onPosition(GpsFix fix) {
+    _pending = fix;
+    final interval = _interval;
+    final elapsed = _sinceEmit.elapsed;
+    if (!_sinceEmit.isRunning || elapsed >= interval) {
+      _flushTimer?.cancel();
+      _flush();
+    } else {
+      _flushTimer ??= Timer(interval - elapsed, _flush);
+    }
+  }
+
+  void _flush() {
+    _flushTimer = null;
+    final fix = _pending;
+    if (fix == null) return;
+    _pending = null;
+    _emit(fix);
+  }
+
+  void _emit(GpsFix fix) {
+    _lastSent = fix;
+    _sinceEmit
+      ..reset()
+      ..start();
+    _onFix(fix);
+  }
+
+  Future<void> stop() async {
+    _flushTimer?.cancel();
+    _flushTimer = null;
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+    await _sub?.cancel();
+    _sub = null;
+  }
 }
 
 class FlipperGpsResponder {
@@ -60,12 +133,14 @@ class FlipperGpsResponder {
 
   StreamSubscription<Main>? _notifications;
   StreamSubscription<FlipperConnectionState>? _connection;
-  StreamSubscription<GpsFix>? _stream;
+  _GpsStreamPump? _pump;
   int? _streamFrequency;
+
   void attach() {
     _notifications ??= _client.notificationStream.listen(_onNotification);
     _connection ??= _client.connectionStream.listen(_onConnection);
   }
+
   Future<void> detach() async {
     await _stopStream();
     final notifications = _notifications;
@@ -94,15 +169,19 @@ class FlipperGpsResponder {
 
   Future<void> _onStreamStart(int frequency) async {
     final hz = frequency.clamp(minFrequency, maxFrequency);
-    if (_stream != null && _streamFrequency == hz) return;
-    if (!await _ensureReady()) return;
-    await _stopStream();
+    if (_streamFrequency == hz) return;
     _streamFrequency = hz;
-    _stream = _provider.watch(hz).listen(
-      (fix) => unawaited(_sendLocation(fix)),
-      onError: (Object error) =>
-          LogService.log('[GPS] location stream error: $error'),
-    );
+    if (!await _ensureReady()) {
+      if (_streamFrequency == hz) _streamFrequency = null;
+      return;
+    }
+    if (_streamFrequency != hz) return;
+    await _stopPump();
+    _pump = _GpsStreamPump(
+      provider: _provider,
+      hz: hz,
+      onFix: (fix) => unawaited(_sendLocation(fix)),
+    )..start();
   }
 
   Future<void> _onLocationRequest() async {
@@ -139,10 +218,15 @@ class FlipperGpsResponder {
 
   Future<void> _stopStream() async {
     _streamFrequency = null;
-    final sub = _stream;
-    _stream = null;
-    await sub?.cancel();
+    await _stopPump();
   }
+
+  Future<void> _stopPump() async {
+    final pump = _pump;
+    _pump = null;
+    await pump?.stop();
+  }
+
   static int _scaleUnsigned(double value, double factor) =>
       value.isFinite && value > 0 ? (value * factor).round() : 0;
 
