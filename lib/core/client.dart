@@ -230,9 +230,7 @@ class FlipperClient {
         return;
       }
 
-      for (final device in await _blePlatform.loadKnownDevices()) {
-        _rememberDevice(_fromDiscovered(device));
-      }
+      await _loadKnownBleDevices();
 
       uble.UniversalBle.onScanResult = (device) {
         final discovered = BleDiscoveredDevice(device);
@@ -825,6 +823,21 @@ class FlipperClient {
       throw StateError('Cannot send CLI bytes while in RPC mode');
     }
     await transport.write(bytes);
+  }
+
+  // Already-bonded / system-connected BLE devices: an instant platform lookup,
+  // no radio scan. Lets callers reconnect to a remembered device without
+  // paying the full scan timeout.
+  Future<List<FlipperDevice>> refreshBleKnown() async {
+    await _loadKnownBleDevices();
+    _emitDevices(immediate: true);
+    return devices;
+  }
+
+  Future<void> _loadKnownBleDevices() async {
+    for (final device in await _blePlatform.loadKnownDevices()) {
+      _rememberDevice(_fromDiscovered(device));
+    }
   }
 
   Future<List<FlipperDevice>> refreshUsbOnly() async {
