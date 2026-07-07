@@ -22,6 +22,7 @@ part 'core/models.dart';
 part 'core/transport.dart';
 part 'core/queue.dart';
 part 'core/protocol.dart';
+part 'core/session.dart';
 part 'core/client.dart';
 part 'api/ble.dart';
 part 'ble/common.dart';

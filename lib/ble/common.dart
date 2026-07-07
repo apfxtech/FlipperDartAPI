@@ -290,11 +290,41 @@ abstract class _UniversalBleTransportBase extends _Transport {
   static const Duration _stallPoll = Duration(seconds: 5);
   static const int _stallPollLimit = 6;
 
-  // Exactly one transport may own the platform link at a time. A stale
-  // attempt's timeout or close must never disconnect a newer connection.
+  // Exactly one transport may own a platform connect attempt at a time. A
+  // stale attempt's timeout or close must never disconnect a newer connection.
   static int _connectAttemptGen = 0;
   static _UniversalBleTransportBase? _connectionOwner;
-  static _UniversalBleTransportBase? _activeTransport;
+
+  // universal_ble exposes exactly one process-global slot per callback, but
+  // multi-session holds several BLE links at once. This static dispatcher
+  // owns the global slot and routes each event to the live transport of that
+  // device; a transport registers when it takes the link and unregisters when
+  // its link dies. The slot itself is never nulled — with no registered
+  // transport the dispatch is a no-op.
+  static final Map<String, _UniversalBleTransportBase> _liveByDevice = {};
+
+  void _registerDispatch() {
+    _liveByDevice[_device.device.deviceId] = this;
+    _ops.onConnectionChange = _dispatchConnectionChange;
+    _ops.onValueChange = _dispatchValueChange;
+  }
+
+  static void _dispatchConnectionChange(
+    String deviceId,
+    bool isConnected,
+    String? error,
+  ) {
+    _liveByDevice[deviceId]?._onConnectionChange(deviceId, isConnected, error);
+  }
+
+  static void _dispatchValueChange(
+    String deviceId,
+    String charId,
+    Uint8List value,
+    int? mtu,
+  ) {
+    _liveByDevice[deviceId]?._onValueChange(deviceId, charId, value, mtu);
+  }
 
   // Aborts whatever platform connect is currently in flight, if any. Lets a
   // user-initiated disconnect during the connect window unwind the attempt
@@ -559,10 +589,8 @@ abstract class _UniversalBleTransportBase extends _Transport {
 
   @override
   Future<void> open() async {
-    _activeTransport = this;
     _connectionOwner = this;
-    _ops.onConnectionChange = _onConnectionChange;
-    _ops.onValueChange = _onValueChange;
+    _registerDispatch();
     // The platform link is already up here (_configure connected it).
     _link = _BleLinkState.connected;
 
@@ -835,10 +863,8 @@ abstract class _UniversalBleTransportBase extends _Transport {
       ]);
       if (pairingAbort.isCompleted) return false;
 
-      _activeTransport = this;
       _connectionOwner = this;
-      _ops.onConnectionChange = _onConnectionChange;
-      _ops.onValueChange = _onValueChange;
+      _registerDispatch();
 
       var aborted = false;
       final abort = _connectAbort = Completer<void>();
@@ -1383,10 +1409,9 @@ abstract class _UniversalBleTransportBase extends _Transport {
   }
 
   void _clearBleCallbacks() {
-    if (_activeTransport == this) {
-      _activeTransport = null;
-      _ops.onConnectionChange = null;
-      _ops.onValueChange = null;
+    final deviceId = _device.device.deviceId;
+    if (identical(_liveByDevice[deviceId], this)) {
+      _liveByDevice.remove(deviceId);
     }
   }
 }

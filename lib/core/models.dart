@@ -44,6 +44,22 @@ class FlipperRpcBatch<T extends $pb.GeneratedMessage> {
   T? get firstOrNull => items.isEmpty ? null : items.first;
 }
 
+/// Snapshot of one held link: the device, its lifecycle state and whether it
+/// is the session all API calls and public streams currently route to.
+class FlipperSessionInfo {
+  final FlipperDevice device;
+  final bool connected;
+  final bool connecting;
+  final bool active;
+
+  const FlipperSessionInfo({
+    required this.device,
+    required this.connected,
+    required this.connecting,
+    required this.active,
+  });
+}
+
 class FlipperConnectionState {
   final FlipperMode mode;
   final FlipperDevice? device;

@@ -12,10 +12,15 @@ extension FlipperWatchApi on FlipperClient {
   /// Start (or restart) the background collection cycle.
   ///
   /// Safe to call multiple times — each call cancels the previous cycle via
-  /// the generation counter. Call from an external controller, not the library.
+  /// the generation counter. The cycle binds to the session that is active at
+  /// start time and dies as soon as that session stops being the active one
+  /// (an activation swap restarts collection for the new device).
+  /// Call from an external controller, not the library.
   void startDeviceInfoCollection() {
     final gen = ++_collectionGen;
-    unawaited(_runCollection(gen));
+    final session = _active;
+    if (session == null) return;
+    unawaited(_runCollection(gen, session));
   }
 
   /// Stop the running collection cycle.
@@ -29,34 +34,41 @@ extension FlipperWatchApi on FlipperClient {
     if (_watchFreezeCount > 0) _watchFreezeCount--;
   }
 
-  Future<void> _runCollection(int gen) async {
-    if (!isConnected) return;
+  Future<void> _runCollection(int gen, _FlipperSession session) async {
+    if (!session.isConnected) return;
 
     void emit(Map<String, String> data) {
-      if (gen != _collectionGen || _deviceInfoWatchCtrl.isClosed) return;
-      _publishDeviceInfoPatch(data);
+      if (gen != _collectionGen) return;
+      session._publishDeviceInfoPatch(data);
     }
 
-    bool alive() => gen == _collectionGen && isConnected;
+    // Every RPC below goes through the facade, which routes to the active
+    // session. alive() is always checked synchronously right before a call,
+    // so a request can never land on another session: an activation swap
+    // kills the loop at the next check.
+    bool alive() =>
+        gen == _collectionGen &&
+        session.isConnected &&
+        identical(_active, session);
 
     // Phase 1: initial burst
 
-    final infoWasFetched = _deviceInfoFetched;
+    final infoWasFetched = session._deviceInfoFetched;
 
     // Device info is requested automatically on entering RPC mode. Individual
     // fields are emitted as they arrive; wait for the complete snapshot before
     // queueing lower-priority requests.
     try {
-      await awaitDeviceInfo().timeout(const Duration(seconds: 20));
+      await session.awaitDeviceInfo().timeout(const Duration(seconds: 20));
     } catch (e) {
       LogService.log('[watchInfo] device info: $e');
     }
     if (!alive()) return;
 
-    // A completed request publishes its snapshot from _autoFetchDeviceInfo.
+    // A completed request publishes its snapshot from _fetchDeviceInfoOnce.
     // Re-emit only when collection starts after that broadcast was missed.
     if (infoWasFetched) {
-      final cached = Map<String, String>.from(deviceInfoCache);
+      final cached = Map<String, String>.from(session.deviceInfoCache);
       if (cached.isNotEmpty) emit(cached);
     }
     if (!alive()) return;
@@ -173,9 +185,9 @@ extension FlipperWatchApi on FlipperClient {
       refreshTimer = Timer(delay, () {
         if (!alive()) return;
         if (_watchFreezeCount > 0 ||
-            storageBusy ||
-            _mode != FlipperMode.rpc ||
-            cliExclusive) {
+            session.storageBusy ||
+            session._mode != FlipperMode.rpc ||
+            session.cliExclusive) {
           // The link is occupied; check again after another quiet window.
           scheduleStorageRefresh();
           return;
@@ -185,7 +197,7 @@ extension FlipperWatchApi on FlipperClient {
       });
     }
 
-    final mutationSub = storageMutations.listen(
+    final mutationSub = session._storageMutationCtrl.stream.listen(
       (_) => scheduleStorageRefresh(),
     );
 
@@ -201,10 +213,10 @@ extension FlipperWatchApi on FlipperClient {
         // A CLI session owns the transport: polling would only throw
         // "RPC switch blocked" every tick and spam the log. Skip quietly and
         // resume once the client is back in RPC mode.
-        if (_mode != FlipperMode.rpc || cliExclusive) continue;
+        if (session._mode != FlipperMode.rpc || session.cliExclusive) continue;
         // Frozen while storage operations run: a battery poll queued behind
         // a long transfer would only time out and spam errors.
-        if (storageBusy) continue;
+        if (session.storageBusy) continue;
         tick++;
 
         if (tick % fullEvery == 0) {
